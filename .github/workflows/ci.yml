@@ -1,9 +1,8 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,7 +14,7 @@ jobs:
   #
   # The suite is not run here — run it locally with `cargo test`. Clippy still
   # uses `--all-targets`, so the tests are compiled and type-checked on every
-  # push and cannot rot unnoticed; they simply are not executed.
+  # pull request and cannot rot unnoticed; they simply are not executed.
   check:
     name: Format and lint
     runs-on: windows-latest
