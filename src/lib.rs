@@ -31,5 +31,6 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::List(args) => commands::list::run(args, &ctx),
         Command::Folder(args) => commands::folder::run(args, &ctx),
         Command::Schedule(args) => commands::schedule::run(args, &ctx),
+        Command::Completions(args) => commands::completions::run(args, &ctx),
     }
 }

@@ -17,6 +17,7 @@ Getting started:
   vmanager run --dry-run                  See what would be archived
   vmanager run                            Archive all but the newest versions
   vmanager schedule install               Run it daily at 03:00
+  vmanager completions --help             Complete commands as you type them
 
 Configuration (optional; every key has a default):
   Windows           %APPDATA%\\vmanager\\config.toml
@@ -145,6 +146,9 @@ pub enum Command {
 
     /// Install or remove the scheduled daily run
     Schedule(crate::commands::schedule::Args),
+
+    /// Print the shell completion script for the given shell
+    Completions(crate::commands::completions::Args),
 }
 
 #[cfg(test)]

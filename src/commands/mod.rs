@@ -4,6 +4,7 @@
 //! [`crate::cli::Command`] embeds — and a `run` function taking the shared
 //! [`Context`].
 
+pub mod completions;
 pub mod folder;
 pub mod list;
 pub mod run;

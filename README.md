@@ -39,6 +39,7 @@ vmanager list                            # see what you have
 vmanager run --dry-run                   # see what would be archived
 vmanager run                             # do it
 vmanager schedule install                # …and every day at 03:00
+vmanager completions powershell          # complete commands as you type them
 ```
 
 ## Usage
@@ -58,6 +59,7 @@ vmanager [OPTIONS] <COMMAND>
 | `schedule install` | Register the daily run with Windows Task Scheduler |
 | `schedule uninstall` | Remove the scheduled task |
 | `schedule status` | Show the scheduled task |
+| `completions [SHELL]` | Print the shell completion script |
 
 ### Global options
 
@@ -228,6 +230,37 @@ it again. An explicit `--config` is carried into the task.
 On non-Windows platforms these commands report that Task Scheduler is not
 available; run `vmanager run` from cron or a systemd timer instead.
 
+## Shell completions
+
+`vmanager completions <SHELL>` writes a completion script to stdout. Put it
+where your shell looks for one:
+
+```powershell
+vmanager completions powershell >> $PROFILE
+```
+
+```sh
+vmanager completions bash > ~/.local/share/bash-completion/completions/vmanager
+vmanager completions zsh  > ~/.zfunc/_vmanager     # ~/.zfunc on $fpath
+vmanager completions fish > ~/.config/fish/completions/vmanager.fish
+vmanager completions elvish >> ~/.config/elvish/rc.elv
+```
+
+Then start a new shell: these files are read once, at startup. To try it
+without installing anything, `eval "$(vmanager completions bash)"`.
+
+Omit the shell and it is guessed from the environment — handy in a profile
+that is shared between machines, though `$SHELL` is the login shell rather
+than the current one and is not set at all under PowerShell, so naming the
+shell is the reliable form.
+
+The script is generated from the same command line definition the binary
+parses with, so it always covers every current subcommand, flag and value. It
+is a snapshot of one version, though: regenerate it after upgrading vmanager.
+
+Completions never read the configuration file or the database, so a broken
+config cannot break the shell that runs this at startup.
+
 ## Database
 
 A single SQLite file, by default `vmanager.db` inside the platform data
@@ -311,6 +344,7 @@ src/
     list.rs           `vmanager list`
     folder.rs         `vmanager folder`
     schedule.rs       `vmanager schedule`
+    completions.rs    `vmanager completions`
 tests/
   cli.rs              end-to-end tests that run the built binary
 ```
