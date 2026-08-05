@@ -54,6 +54,64 @@ fn unknown_subcommand_is_a_usage_error() {
 }
 
 #[test]
+fn completion_scripts_are_written_to_stdout() {
+    for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+        vmanager()
+            .args(["completions", shell])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("vmanager"));
+    }
+}
+
+#[test]
+fn the_completion_script_covers_the_subcommands() {
+    vmanager()
+        .args(["completions", "bash"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("folder"))
+        .stdout(predicate::str::contains("schedule"))
+        .stdout(predicate::str::contains("--config"));
+}
+
+#[test]
+fn completions_do_not_need_a_usable_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, "this is not: valid toml\n").unwrap();
+
+    // A shell profile runs this at startup; a broken config must not break the
+    // shell, and `list` next door proves the file really is unusable.
+    vmanager()
+        .args(["completions", "bash", "--config"])
+        .arg(&config)
+        .assert()
+        .success();
+
+    vmanager()
+        .args(["list", "--config"])
+        .arg(&config)
+        .assert()
+        .code(3);
+}
+
+#[test]
+fn an_unknown_shell_is_a_usage_error() {
+    vmanager().args(["completions", "tcsh"]).assert().code(2);
+}
+
+#[test]
+fn the_shell_can_be_left_to_the_environment() {
+    vmanager()
+        .arg("completions")
+        .env("SHELL", "/bin/bash")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("vmanager"));
+}
+
+#[test]
 fn the_config_environment_variable_is_honoured() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("from-env.toml");
