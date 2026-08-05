@@ -39,7 +39,9 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
-panic = "abort"
+# Not `panic = "abort"`: compression runs in-process, and `archive::create`
+# catches a panic in it so one bad version folder fails on its own instead of
+# killing the sweep and leaving a half-written archive behind.
 
 [lints.rust]
 unsafe_code = "forbid"
