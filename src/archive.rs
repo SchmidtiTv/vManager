@@ -33,25 +33,21 @@ const MT_CHUNK_SIZE: u64 = 64 * 1024 * 1024;
 
 /// Uncompressed bytes in one solid block, i.e. 7-Zip's `-ms=1g`.
 ///
-/// Each block is compressed by its own encoder, and the size is what keeps any
-/// one of them away from a bug in `lzma-rust2` 0.18, which `sevenz-rust2` uses
-/// to compress. Its match finder tracks positions in an `i32` and renormalizes
-/// its lookup tables once a stream has seen `i32::MAX` bytes (~2 GiB). The
-/// scalar renormalization bottoms out at `i32::MIN` (`saturating_sub`) where
-/// the SIMD paths beside it clamp at zero, so stale table entries end up
-/// holding positions near -2^31. A match distance computed from one of those
-/// overflows past `i32::MAX`, wraps negative, passes the "inside the
-/// dictionary" bound check, and the encoder indexes off the front of its
-/// window — an out-of-bounds panic, part-way through any folder over ~2 GiB.
+/// Each block is compressed by its own encoder, so this also bounds how much
+/// data goes through any one of them. `sevenz-rust2` blocks at 4 GiB; a
+/// gigabyte measured no worse on a 2.2 GiB folder (210030677 bytes against
+/// 210031370 in a single block — matches that reach across a boundary are worth
+/// less than the fresh start costs), and it keeps every stream short of the
+/// point where the match finder renormalizes its position tables.
 ///
-/// `sevenz-rust2`'s own solid blocks are 4 GiB, which is past that; ours are
-/// under it. Smaller blocks compress slightly worse, since matches cannot reach
-/// back across a boundary.
-///
-/// This does not cover a *single file* over ~2 GiB: one file is never split
-/// across blocks, so it still goes through one encoder, and the panic is
-/// contained by [`catch_panics`] rather than avoided. Raise this back to the
-/// library's 4 GiB once `lzma-rust2` clamps its scalar renormalization at zero.
+/// That last part used to be load-bearing. `lzma-rust2` 0.18.0 renormalized
+/// with a `saturating_sub` that bottoms out at `i32::MIN` where the SIMD paths
+/// beside it clamped at zero, so once a stream passed `i32::MAX` bytes (~2 GiB)
+/// stale table entries held positions near -2^31; a match distance computed
+/// from one of those wrapped negative, passed the "inside the dictionary" bound
+/// check, and the encoder indexed off the front of its window. 0.18.1 fixes it
+/// (upstream #107) and `Cargo.lock` requires that version — this is no longer a
+/// workaround, just a block size.
 const MAX_BLOCK_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// How an archive should be built.
@@ -186,10 +182,13 @@ pub fn human_bytes(bytes: u64) -> String {
 /// Run the compressor, turning a panic inside it into an ordinary error.
 ///
 /// Compression is a pure-Rust library running in this process, so a bug in it
-/// — see [`MAX_BLOCK_BYTES`] for the one that prompted this — would otherwise
-/// take the whole sweep down with it, leaving the half-written archive on disk
+/// — see [`MAX_BLOCK_BYTES`] for the one that prompted this — takes the whole
+/// sweep down with it otherwise, leaving the half-written archive on disk
 /// looking finished. Contained here it is one failed folder: the partial
 /// archive is removed by the caller and the run carries on.
+///
+/// The bug behind it is fixed upstream, but the containment is worth keeping:
+/// the alternative to an error is losing every folder still to be swept.
 ///
 /// Requires the release profile to unwind rather than abort.
 fn catch_panics<T>(source: &Path, compress: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -792,3 +791,4 @@ mod tests {
         assert_eq!(human_bytes(3 * 1024 * 1024), "3.0 MiB");
     }
 }
+
