@@ -791,4 +791,3 @@ mod tests {
         assert_eq!(human_bytes(3 * 1024 * 1024), "3.0 MiB");
     }
 }
-
