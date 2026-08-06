@@ -195,7 +195,9 @@ The delete is what frees the disk, so it happens last and only after the
 archive has been proven good:
 
 1. the archive is written to a fresh `.7z`, and deleted again if compression
-   fails — a `.7z` on disk is never half-written;
+   fails — a `.7z` on disk is never half-written. That includes the compressor
+   crashing outright: it runs in-process, so a panic in it is caught, reported
+   as that one folder failing, and the partial archive removed;
 2. it is read back and its file count compared against what was walked;
 3. only then is the version folder removed.
 

@@ -2,15 +2,17 @@
 //!
 //! Compression is pure Rust ([`sevenz_rust2`]) — no `7z` binary needs to be
 //! installed. Archives use LZMA2 in solid mode, which is what 7-Zip itself
-//! produces by default.
+//! produces by default, in blocks of [`MAX_BLOCK_BYTES`].
 //!
 //! Entry names are relative to the *parent* of the source folder, so
 //! archiving `Blender\4.1` yields an archive containing `4.1/…` — the same
 //! layout as `7z a 4.1.7z 4.1`, so a version restores under its own name.
 
+use std::any::Any;
+use std::panic::AssertUnwindSafe;
 use std::path::{Component, Path, PathBuf};
 
-use sevenz_rust2::{ArchiveWriter, encoder_options::Lzma2Options};
+use sevenz_rust2::{ArchiveEntry, ArchiveWriter, SourceReader, encoder_options::Lzma2Options};
 
 use crate::error::{Error, Result};
 
@@ -28,6 +30,25 @@ pub const DEFAULT_LEVEL: u32 = 6;
 /// Only used when `threads > 1`; larger chunks compress better, smaller ones
 /// parallelize better. Clamped up to the dictionary size by the encoder.
 const MT_CHUNK_SIZE: u64 = 64 * 1024 * 1024;
+
+/// Uncompressed bytes in one solid block, i.e. 7-Zip's `-ms=1g`.
+///
+/// Each block is compressed by its own encoder, so this also bounds how much
+/// data goes through any one of them. `sevenz-rust2` blocks at 4 GiB; a
+/// gigabyte measured no worse on a 2.2 GiB folder (210030677 bytes against
+/// 210031370 in a single block — matches that reach across a boundary are worth
+/// less than the fresh start costs), and it keeps every stream short of the
+/// point where the match finder renormalizes its position tables.
+///
+/// That last part used to be load-bearing. `lzma-rust2` 0.18.0 renormalized
+/// with a `saturating_sub` that bottoms out at `i32::MIN` where the SIMD paths
+/// beside it clamped at zero, so once a stream passed `i32::MAX` bytes (~2 GiB)
+/// stale table entries held positions near -2^31; a match distance computed
+/// from one of those wrapped negative, passed the "inside the dictionary" bound
+/// check, and the encoder indexed off the front of its window. 0.18.1 fixes it
+/// (upstream #107) and `Cargo.lock` requires that version — this is no longer a
+/// workaround, just a block size.
+const MAX_BLOCK_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// How an archive should be built.
 #[derive(Debug, Clone)]
@@ -112,7 +133,11 @@ pub fn create(source: &Path, dest: &Path, options: &Options) -> Result<Summary> 
         "creating archive"
     );
 
-    match write_archive(&source, &dest, options) {
+    let written = catch_panics(&source, || {
+        write_archive(&source, &dest, options, MAX_BLOCK_BYTES)
+    });
+
+    match written {
         Ok(()) => {}
         Err(err) => {
             // A half-written archive is worse than none: it looks usable.
@@ -154,36 +179,138 @@ pub fn human_bytes(bytes: u64) -> String {
     }
 }
 
+/// Run the compressor, turning a panic inside it into an ordinary error.
+///
+/// Compression is a pure-Rust library running in this process, so a bug in it
+/// — see [`MAX_BLOCK_BYTES`] for the one that prompted this — takes the whole
+/// sweep down with it otherwise, leaving the half-written archive on disk
+/// looking finished. Contained here it is one failed folder: the partial
+/// archive is removed by the caller and the run carries on.
+///
+/// The bug behind it is fixed upstream, but the containment is worth keeping:
+/// the alternative to an error is losing every folder still to be swept.
+///
+/// Requires the release profile to unwind rather than abort.
+fn catch_panics<T>(source: &Path, compress: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(AssertUnwindSafe(compress)).unwrap_or_else(|payload| {
+        Err(Error::Archive(format!(
+            "compressing `{}` panicked: {}; the source folder was left alone",
+            source.display(),
+            panic_message(&*payload)
+        )))
+    })
+}
+
+/// The text a panic carried, for the payloads `panic!` actually produces.
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    if let Some(text) = payload.downcast_ref::<&'static str>() {
+        text
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text
+    } else {
+        "no message"
+    }
+}
+
 /// Compress the tree. Split out so `create` can clean up after a failure.
-fn write_archive(source: &Path, dest: &Path, options: &Options) -> Result<()> {
+///
+/// `block_bytes` is how much uncompressed data goes into one solid block. See
+/// [`MAX_BLOCK_BYTES`].
+fn write_archive(source: &Path, dest: &Path, options: &Options, block_bytes: u64) -> Result<()> {
+    // Names are relative to the parent, which is what keeps the folder name in
+    // the archive; only `source` itself is walked, so no sibling can get in.
+    let root = source.parent().unwrap_or(source);
+    let files = walk(source, options)?;
+
     let mut writer = ArchiveWriter::create(dest).map_err(archive_error)?;
     writer.set_content_methods(vec![lzma2_options(options).into()]);
 
-    // Pushing from the parent keeps the folder name in the archive; the filter
-    // prunes every sibling, so nothing outside `source` is walked.
-    let root = source.parent().unwrap_or(source);
-    let exclude = options.exclude.clone();
-    let (source_owned, dest_owned) = (source.to_path_buf(), dest.to_path_buf());
+    let (mut entries, mut readers) = (Vec::new(), Vec::new());
+    let mut pending = 0u64;
 
-    writer
-        .push_source_path(root, move |path| {
-            if path == root {
-                return true;
-            }
-            if !path.starts_with(&source_owned) || path == dest_owned {
-                return false;
-            }
-            let keep = !is_excluded(path, &source_owned, &exclude);
-            if !keep {
-                tracing::debug!(path = %path.display(), "excluded");
-            }
-            keep
-        })
-        .map_err(archive_error)?;
+    for file in files {
+        if file.path == dest {
+            continue;
+        }
+
+        // The file that would push this block past the limit starts the next
+        // one. A file bigger than the limit on its own gets a block to itself.
+        if !entries.is_empty() && pending + file.size > block_bytes {
+            push_block(&mut writer, &mut entries, &mut readers)?;
+            pending = 0;
+        }
+
+        let name = file
+            .path
+            .strip_prefix(root)
+            .unwrap_or(&file.path)
+            .to_string_lossy()
+            .to_string();
+        entries.push(ArchiveEntry::from_path(&file.path, name));
+        readers.push(LazyFile::new(file.path).into());
+        pending += file.size;
+    }
+
+    if !entries.is_empty() {
+        push_block(&mut writer, &mut entries, &mut readers)?;
+    }
 
     // `finish` flushes the 7z footer; a failure here means a truncated file.
     writer.finish()?;
     Ok(())
+}
+
+/// Compress one solid block, leaving the buffers empty for the next.
+fn push_block<W: std::io::Write + std::io::Seek>(
+    writer: &mut ArchiveWriter<W>,
+    entries: &mut Vec<ArchiveEntry>,
+    readers: &mut Vec<SourceReader<LazyFile>>,
+) -> Result<()> {
+    tracing::debug!(files = entries.len(), "compressing block");
+    writer
+        .push_archive_entries(std::mem::take(entries), std::mem::take(readers))
+        .map_err(archive_error)?;
+    Ok(())
+}
+
+/// A file opened on first read.
+///
+/// A block holds every file in it at once, and a version folder can hold
+/// thousands, which is more file handles than the process is entitled to.
+struct LazyFile {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    done: bool,
+}
+
+impl LazyFile {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            file: None,
+            done: false,
+        }
+    }
+}
+
+impl std::io::Read for LazyFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.done {
+            return Ok(0);
+        }
+
+        let file = match &mut self.file {
+            Some(file) => file,
+            none => none.insert(std::fs::File::open(&self.path)?),
+        };
+
+        let read = file.read(buf)?;
+        if read == 0 {
+            self.done = true;
+            self.file = None;
+        }
+        Ok(read)
+    }
 }
 
 fn lzma2_options(options: &Options) -> Lzma2Options {
@@ -195,35 +322,59 @@ fn lzma2_options(options: &Options) -> Lzma2Options {
     }
 }
 
-/// Count the files that will be stored and their total size.
+/// One file to be stored.
+struct SourceFile {
+    path: PathBuf,
+    size: u64,
+}
+
+/// Every file under `source` that is not excluded, sorted by path.
 ///
-/// Walked separately from the compression pass so the summary is known up
-/// front; the cost is one extra `stat` per file.
-fn measure(source: &Path, options: &Options) -> Result<(u64, u64)> {
+/// Sorted because `read_dir` order is the filesystem's business: without it the
+/// same tree could be split into blocks differently from one run to the next,
+/// and neighbouring files — which are the ones worth having in a block together
+/// — would land wherever.
+///
+/// Symlinks are skipped: `file_type` does not follow them, so a link is neither
+/// stored as a copy of its target nor followed into a loop.
+fn walk(source: &Path, options: &Options) -> Result<Vec<SourceFile>> {
     let mut stack = vec![source.to_path_buf()];
-    let (mut count, mut bytes) = (0u64, 0u64);
+    let mut files = Vec::new();
 
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
             let path = entry.path();
             if is_excluded(&path, source, &options.exclude) {
+                tracing::debug!(path = %path.display(), "excluded");
                 continue;
             }
 
-            // `file_type` does not follow symlinks, so links are skipped rather
-            // than silently duplicating their target (or looping forever).
             let file_type = entry.file_type()?;
             if file_type.is_dir() {
                 stack.push(path);
             } else if file_type.is_file() {
-                count += 1;
-                bytes += entry.metadata()?.len();
+                files.push(SourceFile {
+                    path,
+                    size: entry.metadata()?.len(),
+                });
             }
         }
     }
 
-    Ok((count, bytes))
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(files)
+}
+
+/// Count the files that will be stored and their total size.
+///
+/// Walked separately from the compression pass so the summary is known up
+/// front; the cost is one extra `stat` per file.
+fn measure(source: &Path, options: &Options) -> Result<(u64, u64)> {
+    let files = walk(source, options)?;
+    let bytes = files.iter().map(|file| file.size).sum();
+
+    Ok((files.len() as u64, bytes))
 }
 
 /// Whether any path component below `root` matches an exclude pattern.
@@ -519,6 +670,116 @@ mod tests {
 
         let err = create(&source, &dir.path().join("x.7z"), &Options::default()).unwrap_err();
         assert!(err.to_string().contains("no files"), "{err}");
+    }
+
+    /// `size` bytes that compress well, but only with a dictionary reaching
+    /// back further than one block: one pseudo-random block repeated.
+    fn repetitive(size: usize, block: usize) -> Vec<u8> {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut seed = vec![0u8; block];
+        for chunk in seed.chunks_mut(8) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let bytes = state.to_le_bytes();
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
+        }
+
+        seed.iter().copied().cycle().take(size).collect()
+    }
+
+    /// Splitting into blocks is what keeps each encoder away from the overflow
+    /// in [`MAX_BLOCK_BYTES`], so a multi-block archive has to read back byte
+    /// for byte. Testing at the real block size would mean compressing a
+    /// gigabyte, so the test uses a small one.
+    #[test]
+    fn a_multi_block_archive_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("big");
+        std::fs::create_dir(&source).unwrap();
+
+        // Four files of 512 KiB, each the same block repeated, so a match that
+        // reaches back across a block boundary is worth a lot and its absence
+        // shows up in the archive size below.
+        let content = repetitive(512 * 1024, 128 * 1024);
+        for index in 0..4 {
+            std::fs::write(source.join(format!("part{index}.bin")), &content).unwrap();
+        }
+
+        let options = Options {
+            level: 0,
+            ..Options::default()
+        };
+        let split = dir.path().join("split.7z");
+        write_archive(&source, &split, &options, 512 * 1024).unwrap();
+
+        let out = dir.path().join("restored");
+        sevenz_rust2::decompress_file(&split, &out).unwrap();
+        for index in 0..4 {
+            assert_eq!(
+                std::fs::read(out.join(format!("big/part{index}.bin"))).unwrap(),
+                content,
+                "part{index}.bin came back different"
+            );
+        }
+
+        // Without this the test would pass just as well if everything had gone
+        // into one block. Each block starts with an empty dictionary, so four
+        // of them cost four copies of the data the single block stores once.
+        let single = dir.path().join("single.7z");
+        write_archive(&source, &single, &options, MAX_BLOCK_BYTES).unwrap();
+        let (split_bytes, single_bytes) = (
+            std::fs::metadata(&split).unwrap().len(),
+            std::fs::metadata(&single).unwrap().len(),
+        );
+        assert!(
+            split_bytes > single_bytes,
+            "the block size did not take effect: {split_bytes} bytes split vs {single_bytes} in one block"
+        );
+    }
+
+    /// A file of its own bigger than the block size still has to be stored,
+    /// alone in a block rather than split across two.
+    #[test]
+    fn a_file_larger_than_a_block_is_stored_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("big");
+        std::fs::create_dir(&source).unwrap();
+        let content = repetitive(1024 * 1024, 128 * 1024);
+        std::fs::write(source.join("huge.bin"), &content).unwrap();
+        std::fs::write(source.join("small.txt"), "after the huge one").unwrap();
+
+        let dest = dir.path().join("out.7z");
+        let options = Options {
+            level: 0,
+            ..Options::default()
+        };
+        write_archive(&source, &dest, &options, 64 * 1024).unwrap();
+
+        let out = dir.path().join("restored");
+        sevenz_rust2::decompress_file(&dest, &out).unwrap();
+        assert_eq!(std::fs::read(out.join("big/huge.bin")).unwrap(), content);
+        assert_eq!(
+            std::fs::read_to_string(out.join("big/small.txt")).unwrap(),
+            "after the huge one"
+        );
+    }
+
+    /// A panic in the compressor has to come back as a failure for this one
+    /// folder. Compressing 2 GiB to provoke the real one is not a test, so this
+    /// covers the containment itself.
+    #[test]
+    fn a_panic_while_compressing_becomes_an_error() {
+        let err = catch_panics(Path::new("/tools/blender/4.1"), || -> Result<()> {
+            panic!("index out of bounds: the len is 12853521")
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, Error::Archive(_)));
+        let message = err.to_string();
+        assert!(message.contains("panicked"), "{message}");
+        assert!(message.contains("12853521"), "{message}");
+        assert!(message.contains("4.1"), "{message}");
     }
 
     #[test]
