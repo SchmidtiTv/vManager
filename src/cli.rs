@@ -17,6 +17,8 @@ Getting started:
   vmanager run --dry-run                  See what would be archived
   vmanager run                            Archive all but the newest versions
   vmanager use C:\\Tools\\Blender 4.3      Point `current` at a version
+  vmanager shim regenerate                 Rebuild a folder's shim\\ scripts
+  vmanager hook set nodejs node setup.ps1  Run a script before `node` launches
   vmanager schedule install               Run it daily at 03:00
   vmanager completions --help             Complete commands as you type them
 
@@ -150,6 +152,12 @@ pub enum Command {
 
     /// Install or remove the scheduled daily run
     Schedule(crate::commands::schedule::Args),
+
+    /// Inspect or rebuild a folder's generated command shims
+    Shim(crate::commands::shim::Args),
+
+    /// Configure the pre-hook a shim runs before its command
+    Hook(crate::commands::hook::Args),
 
     /// Print the shell completion script for the given shell
     Completions(crate::commands::completions::Args),

@@ -101,7 +101,7 @@ mod tests {
     #[test]
     fn the_script_knows_the_subcommands() {
         let script = String::from_utf8(generate(Shell::Bash)).unwrap();
-        for subcommand in ["run", "list", "folder", "schedule"] {
+        for subcommand in ["run", "list", "folder", "schedule", "shim", "hook"] {
             assert!(
                 script.contains(subcommand),
                 "`{subcommand}` should be completable"

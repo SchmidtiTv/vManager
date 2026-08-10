@@ -13,6 +13,7 @@ pub mod db;
 pub mod error;
 pub mod link;
 pub mod logging;
+pub mod shim;
 pub mod sweep;
 pub mod version;
 
@@ -33,6 +34,8 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Folder(args) => commands::folder::run(args, &ctx),
         Command::Use(args) => commands::r#use::run(args, &ctx),
         Command::Schedule(args) => commands::schedule::run(args, &ctx),
+        Command::Shim(args) => commands::shim::run(args, &ctx),
+        Command::Hook(args) => commands::hook::run(args, &ctx),
         Command::Completions(args) => commands::completions::run(args, &ctx),
     }
 }

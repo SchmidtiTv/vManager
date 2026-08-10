@@ -51,6 +51,25 @@ const MIGRATIONS: &[&str] = &[
 
     CREATE INDEX archives_folder_id ON archives (folder_id);
     "#,
+    // v3 — pre-hooks for command shims: `vmanager hook set <folder>
+    // <command> <script>`. Keyed by the folder's path rather than a
+    // `folder_id` foreign key: `vmanager use` (and the shim regeneration it
+    // triggers) works on a folder whether or not it is registered — see
+    // `commands::run::targets` for the same "does not require registration"
+    // pattern — so a hook must be settable the same way, before or without
+    // ever running `vmanager folder add`.
+    r#"
+    CREATE TABLE hooks (
+        id          INTEGER PRIMARY KEY,
+        folder_path TEXT    NOT NULL,
+        command     TEXT    NOT NULL,
+        script_path TEXT    NOT NULL,
+        added_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        UNIQUE (folder_path, command)
+    );
+
+    CREATE INDEX hooks_folder_path ON hooks (folder_path);
+    "#,
 ];
 
 /// What the `archives` table remembers about one `.7z`.
@@ -80,6 +99,21 @@ pub struct FolderRecord {
     pub path: PathBuf,
     /// How many versions to keep unpacked, overriding the configured default.
     pub keep: Option<u32>,
+    /// UTC, ISO-8601, written by SQLite.
+    pub added_at: String,
+}
+
+/// One row of the `hooks` table: a pre-hook configured for a `(folder,
+/// command)` pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookRecord {
+    /// The folder the hook applies to, canonicalized the same way a
+    /// registered folder's path is.
+    pub folder_path: PathBuf,
+    /// The shim command name the hook runs ahead of, e.g. `node`.
+    pub command: String,
+    /// The hook script to run before the real executable.
+    pub script_path: PathBuf,
     /// UTC, ISO-8601, written by SQLite.
     pub added_at: String,
 }
@@ -254,6 +288,66 @@ impl Database {
         )? as u64)
     }
 
+    /// Configure the pre-hook for a `(folder, command)` pair, replacing
+    /// whatever it was set to before.
+    pub fn set_hook(&self, folder: &Path, command: &str, script: &Path) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO hooks (folder_path, command, script_path) VALUES (?1, ?2, ?3)
+             ON CONFLICT (folder_path, command) DO UPDATE SET
+                 script_path = excluded.script_path,
+                 added_at    = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+            params![folder.to_string_lossy(), command, script.to_string_lossy(),],
+        )?;
+        Ok(())
+    }
+
+    /// Remove the hook configured for a `(folder, command)` pair.
+    pub fn remove_hook(&self, folder: &Path, command: &str) -> Result<HookRecord> {
+        let record = self.hook(folder, command)?.ok_or_else(|| Error::NotFound {
+            kind: "hook",
+            name: format!("{command} on {}", folder.display()),
+        })?;
+
+        self.conn.execute(
+            "DELETE FROM hooks WHERE folder_path = ?1 AND command = ?2",
+            params![folder.to_string_lossy(), command],
+        )?;
+        Ok(record)
+    }
+
+    /// The hook configured for one `(folder, command)` pair, if any.
+    pub fn hook(&self, folder: &Path, command: &str) -> Result<Option<HookRecord>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT folder_path, command, script_path, added_at
+                   FROM hooks WHERE folder_path = ?1 AND command = ?2",
+                params![folder.to_string_lossy(), command],
+                row_to_hook,
+            )
+            .optional()?)
+    }
+
+    /// Every hook configured for one folder, ordered by command name.
+    pub fn hooks_for_folder(&self, folder: &Path) -> Result<Vec<HookRecord>> {
+        let mut statement = self.conn.prepare(
+            "SELECT folder_path, command, script_path, added_at
+               FROM hooks WHERE folder_path = ?1 ORDER BY command",
+        )?;
+        let rows = statement.query_map([folder.to_string_lossy()], row_to_hook)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every configured hook, ordered by folder then command.
+    pub fn hooks(&self) -> Result<Vec<HookRecord>> {
+        let mut statement = self.conn.prepare(
+            "SELECT folder_path, command, script_path, added_at
+               FROM hooks ORDER BY folder_path, command",
+        )?;
+        let rows = statement.query_map([], row_to_hook)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Connection-level settings applied on every open.
     fn configure(&mut self) -> Result<()> {
         self.conn.busy_timeout(BUSY_TIMEOUT)?;
@@ -302,6 +396,15 @@ fn row_to_folder(row: &rusqlite::Row<'_>) -> rusqlite::Result<FolderRecord> {
         id: row.get(0)?,
         path: PathBuf::from(row.get::<_, String>(1)?),
         keep: row.get::<_, Option<i64>>(2)?.map(|keep| keep as u32),
+        added_at: row.get(3)?,
+    })
+}
+
+fn row_to_hook(row: &rusqlite::Row<'_>) -> rusqlite::Result<HookRecord> {
+    Ok(HookRecord {
+        folder_path: PathBuf::from(row.get::<_, String>(0)?),
+        command: row.get(1)?,
+        script_path: PathBuf::from(row.get::<_, String>(2)?),
         added_at: row.get(3)?,
     })
 }
@@ -483,5 +586,126 @@ mod tests {
         let err = Database::open(&path).unwrap_err();
         assert!(matches!(err, Error::Database(_)), "{err}");
         assert!(err.to_string().contains("upgrade vmanager"), "{err}");
+    }
+
+    #[test]
+    fn setting_and_reading_back_a_hook() {
+        let db = Database::open_in_memory().unwrap();
+        db.set_hook(
+            Path::new("/tools/nodejs"),
+            "node",
+            Path::new("/hooks/node.ps1"),
+        )
+        .unwrap();
+
+        let hook = db
+            .hook(Path::new("/tools/nodejs"), "node")
+            .unwrap()
+            .expect("just set");
+        assert_eq!(hook.folder_path, PathBuf::from("/tools/nodejs"));
+        assert_eq!(hook.command, "node");
+        assert_eq!(hook.script_path, PathBuf::from("/hooks/node.ps1"));
+    }
+
+    #[test]
+    fn setting_a_hook_again_updates_it_rather_than_duplicating() {
+        let db = Database::open_in_memory().unwrap();
+        db.set_hook(Path::new("/tools/nodejs"), "node", Path::new("/a.ps1"))
+            .unwrap();
+        db.set_hook(Path::new("/tools/nodejs"), "node", Path::new("/b.ps1"))
+            .unwrap();
+
+        let hooks = db.hooks_for_folder(Path::new("/tools/nodejs")).unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].script_path, PathBuf::from("/b.ps1"));
+    }
+
+    #[test]
+    fn the_same_command_can_have_different_hooks_in_different_folders() {
+        let db = Database::open_in_memory().unwrap();
+        db.set_hook(Path::new("/tools/nodejs"), "node", Path::new("/a.ps1"))
+            .unwrap();
+        db.set_hook(Path::new("/tools/other-node"), "node", Path::new("/b.ps1"))
+            .unwrap();
+
+        assert_eq!(
+            db.hook(Path::new("/tools/nodejs"), "node")
+                .unwrap()
+                .unwrap()
+                .script_path,
+            PathBuf::from("/a.ps1")
+        );
+        assert_eq!(
+            db.hook(Path::new("/tools/other-node"), "node")
+                .unwrap()
+                .unwrap()
+                .script_path,
+            PathBuf::from("/b.ps1")
+        );
+    }
+
+    #[test]
+    fn a_hook_can_be_set_without_the_folder_being_registered() {
+        // `vmanager use` and its shim regeneration work on an unregistered
+        // folder too (see `commands::run::targets`), so a hook must be
+        // settable the same way.
+        let db = Database::open_in_memory().unwrap();
+        db.set_hook(Path::new("/tools/nodejs"), "node", Path::new("/a.ps1"))
+            .unwrap();
+        assert!(db.folders().unwrap().is_empty());
+        assert!(
+            db.hook(Path::new("/tools/nodejs"), "node")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn removing_a_hook_returns_the_record_and_deletes_it() {
+        let db = Database::open_in_memory().unwrap();
+        db.set_hook(Path::new("/tools/nodejs"), "node", Path::new("/a.ps1"))
+            .unwrap();
+
+        let removed = db.remove_hook(Path::new("/tools/nodejs"), "node").unwrap();
+        assert_eq!(removed.script_path, PathBuf::from("/a.ps1"));
+        assert!(
+            db.hook(Path::new("/tools/nodejs"), "node")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn removing_an_unconfigured_hook_is_not_found() {
+        let db = Database::open_in_memory().unwrap();
+        assert!(matches!(
+            db.remove_hook(Path::new("/tools/nodejs"), "node"),
+            Err(Error::NotFound { kind: "hook", .. })
+        ));
+    }
+
+    #[test]
+    fn hooks_lists_every_configured_hook_across_folders() {
+        let db = Database::open_in_memory().unwrap();
+        db.set_hook(Path::new("/tools/nodejs"), "node", Path::new("/a.ps1"))
+            .unwrap();
+        db.set_hook(Path::new("/tools/nodejs"), "npm", Path::new("/b.ps1"))
+            .unwrap();
+        db.set_hook(Path::new("/tools/godot"), "godot", Path::new("/c.ps1"))
+            .unwrap();
+
+        assert_eq!(db.hooks().unwrap().len(), 3);
+        assert_eq!(
+            db.hooks_for_folder(Path::new("/tools/nodejs"))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            db.hooks_for_folder(Path::new("/tools/godot"))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

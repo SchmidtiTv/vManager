@@ -546,7 +546,9 @@ fn one_broken_folder_does_not_stop_the_others() {
             .assert()
             .success();
     }
-    std::fs::remove_dir(&gone).unwrap();
+    // `remove_dir_all`, not `remove_dir`: `folder add` now also creates an
+    // (empty) `shim\` inside it, so the folder is no longer empty itself.
+    std::fs::remove_dir_all(&gone).unwrap();
 
     // The missing folder fails the run, but only after the healthy one has
     // been swept — a disconnected drive must not strand every other tool.
@@ -801,13 +803,19 @@ fn list_survives_a_folder_that_has_gone_missing() {
 
 #[test]
 fn use_points_current_at_a_version_and_reports_it_back() {
-    let dir = tempfile::tempdir().unwrap();
+    // `isolated`, not a bare tempdir: setting a version now also opens the
+    // database (to look up hooks and regenerate shims), so this must not
+    // touch the real platform database like every other `--config`-bearing
+    // test avoids doing.
+    let (dir, config) = isolated();
     let tool = tool_folder(dir.path(), "node", &["18.20", "20.11"]);
 
     vmanager()
         .arg("use")
         .arg(&tool)
         .arg("20.11")
+        .arg("--config")
+        .arg(&config)
         .assert()
         .success()
         .stdout(predicate::str::contains("current"))
@@ -817,6 +825,8 @@ fn use_points_current_at_a_version_and_reports_it_back() {
     vmanager()
         .arg("use")
         .arg(&tool)
+        .arg("--config")
+        .arg(&config)
         .assert()
         .success()
         .stdout(predicate::str::contains("20.11"));
@@ -825,6 +835,8 @@ fn use_points_current_at_a_version_and_reports_it_back() {
     vmanager()
         .args(["list", "--folder"])
         .arg(&tool)
+        .arg("--config")
+        .arg(&config)
         .assert()
         .success()
         .stdout(predicate::str::contains("20.11").and(predicate::str::contains("(current)")))
@@ -833,25 +845,31 @@ fn use_points_current_at_a_version_and_reports_it_back() {
 
 #[test]
 fn use_can_be_repointed_and_then_cleared() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, config) = isolated();
     let tool = tool_folder(dir.path(), "node", &["18.20", "20.11"]);
 
     vmanager()
         .arg("use")
         .arg(&tool)
         .arg("18.20")
+        .arg("--config")
+        .arg(&config)
         .assert()
         .success();
     vmanager()
         .arg("use")
         .arg(&tool)
         .arg("20.11")
+        .arg("--config")
+        .arg(&config)
         .assert()
         .success();
 
     vmanager()
         .arg("use")
         .arg(&tool)
+        .arg("--config")
+        .arg(&config)
         .assert()
         .success()
         .stdout(predicate::str::contains("20.11"));
@@ -860,6 +878,8 @@ fn use_can_be_repointed_and_then_cleared() {
         .arg("use")
         .arg(&tool)
         .arg("--clear")
+        .arg("--config")
+        .arg(&config)
         .assert()
         .success()
         .stdout(predicate::str::contains("cleared"));
@@ -867,6 +887,8 @@ fn use_can_be_repointed_and_then_cleared() {
     vmanager()
         .arg("use")
         .arg(&tool)
+        .arg("--config")
+        .arg(&config)
         .assert()
         .success()
         .stdout(predicate::str::contains("no current link"));
@@ -874,20 +896,22 @@ fn use_can_be_repointed_and_then_cleared() {
 
 #[test]
 fn use_on_a_version_that_does_not_exist_is_not_found() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, config) = isolated();
     let tool = tool_folder(dir.path(), "node", &["18.20"]);
 
     vmanager()
         .arg("use")
         .arg(&tool)
         .arg("99.0")
+        .arg("--config")
+        .arg(&config)
         .assert()
         .code(4);
 }
 
 #[test]
 fn use_and_a_version_number_conflict_with_clear() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, config) = isolated();
     let tool = tool_folder(dir.path(), "node", &["18.20"]);
 
     vmanager()
@@ -895,6 +919,8 @@ fn use_and_a_version_number_conflict_with_clear() {
         .arg(&tool)
         .arg("18.20")
         .arg("--clear")
+        .arg("--config")
+        .arg(&config)
         .assert()
         .code(2);
 }
@@ -910,6 +936,8 @@ fn the_current_link_is_not_swept_as_a_version() {
         .arg("use")
         .arg(&tool)
         .arg("20.11")
+        .arg("--config")
+        .arg(&config)
         .assert()
         .success();
 
@@ -934,4 +962,477 @@ fn the_current_link_is_not_swept_as_a_version() {
 
     assert_eq!(link::current(&tool).unwrap().as_deref(), Some("20.11"));
     assert!(tool.join("20.11").is_dir());
+}
+
+// --- command shims and hooks ------------------------------------------------
+
+#[test]
+fn folder_add_creates_an_empty_shim_directory() {
+    let (dir, config) = isolated();
+    let tool = tool_folder(dir.path(), "blender", &["4.1"]);
+
+    vmanager()
+        .args(["folder", "add"])
+        .arg(&tool)
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success();
+
+    let shim_dir = tool.join("shim");
+    assert!(shim_dir.is_dir());
+    assert_eq!(std::fs::read_dir(&shim_dir).unwrap().count(), 0);
+}
+
+#[test]
+fn folder_remove_leaves_the_shim_directory_and_its_scripts_on_disk() {
+    let (dir, config) = isolated();
+    let tool = tool_folder(dir.path(), "blender", &["4.1"]);
+
+    vmanager()
+        .args(["folder", "add"])
+        .arg(&tool)
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success();
+    vmanager()
+        .arg("use")
+        .arg(&tool)
+        .arg("4.1")
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success();
+    assert!(tool.join("shim").join("tool.ps1").is_file());
+
+    vmanager()
+        .args(["folder", "remove"])
+        .arg(&tool)
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success();
+
+    // "nothing on disk is touched" applies to `shim\` too.
+    assert!(tool.join("shim").join("tool.ps1").is_file());
+}
+
+#[test]
+fn use_populates_a_shim_for_every_discovered_exe() {
+    let (dir, config) = isolated();
+    let tool = tool_folder(dir.path(), "node", &["18.20", "20.11"]);
+
+    vmanager()
+        .arg("use")
+        .arg(&tool)
+        .arg("20.11")
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success();
+
+    let script = tool.join("shim").join("tool.ps1");
+    assert!(script.is_file());
+    let content = std::fs::read_to_string(&script).unwrap();
+    assert!(content.contains("DO NOT EDIT"), "{content}");
+    // Resolved through `current`, not baked to `20.11`.
+    assert!(content.contains("current\\tool.exe"), "{content}");
+    assert!(!content.contains("20.11"), "{content}");
+}
+
+#[test]
+fn switching_to_a_version_with_the_same_exe_set_does_not_rewrite_the_shim() {
+    let (dir, config) = isolated();
+    let tool = tool_folder(dir.path(), "node", &["18.20", "20.11"]);
+
+    vmanager()
+        .arg("use")
+        .arg(&tool)
+        .arg("18.20")
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success();
+    let script = tool.join("shim").join("tool.ps1");
+    let before = std::fs::metadata(&script).unwrap().modified().unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    vmanager()
+        .arg("use")
+        .arg(&tool)
+        .arg("20.11")
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success();
+
+    let after = std::fs::metadata(&script).unwrap().modified().unwrap();
+    assert_eq!(
+        before, after,
+        "the junction alone should retarget the shim; the file itself must not be rewritten"
+    );
+    assert_eq!(link::current(&tool).unwrap().as_deref(), Some("20.11"));
+}
+
+#[test]
+fn hook_set_patches_an_already_existing_shim_immediately() {
+    let (dir, config) = isolated();
+    let tool = tool_folder(dir.path(), "node", &["18.20"]);
+    let hook_script = dir.path().join("hook.ps1");
+    std::fs::write(&hook_script, "# hook\n").unwrap();
+
+    vmanager()
+        .arg("use")
+        .arg(&tool)
+        .arg("18.20")
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success();
+
+    vmanager()
+        .args(["hook", "set"])
+        .arg(&tool)
+        .arg("tool")
+        .arg(&hook_script)
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("updated"));
+
+    let canonical_hook = hook_script.canonicalize().unwrap();
+    let content = std::fs::read_to_string(tool.join("shim").join("tool.ps1")).unwrap();
+    assert!(
+        content.contains(&canonical_hook.display().to_string()),
+        "{content}"
+    );
+}
+
+#[test]
+fn hook_set_before_the_shim_exists_takes_effect_on_the_next_use() {
+    let (dir, config) = isolated();
+    let tool = tool_folder(dir.path(), "node", &["18.20"]);
+    let hook_script = dir.path().join("hook.ps1");
+    std::fs::write(&hook_script, "# hook\n").unwrap();
+
+    vmanager()
+        .args(["folder", "add"])
+        .arg(&tool)
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success();
+
+    vmanager()
+        .args(["hook", "set"])
+        .arg(&tool)
+        .arg("tool")
+        .arg(&hook_script)
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no shim yet"));
+    assert!(!tool.join("shim").join("tool.ps1").exists());
+
+    vmanager()
+        .arg("use")
+        .arg(&tool)
+        .arg("18.20")
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success();
+
+    let canonical_hook = hook_script.canonicalize().unwrap();
+    let content = std::fs::read_to_string(tool.join("shim").join("tool.ps1")).unwrap();
+    assert!(
+        content.contains(&canonical_hook.display().to_string()),
+        "{content}"
+    );
+}
+
+#[test]
+fn hook_remove_clears_the_hook_from_an_existing_shim() {
+    let (dir, config) = isolated();
+    let tool = tool_folder(dir.path(), "node", &["18.20"]);
+    let hook_script = dir.path().join("hook.ps1");
+    std::fs::write(&hook_script, "# hook\n").unwrap();
+
+    vmanager()
+        .arg("use")
+        .arg(&tool)
+        .arg("18.20")
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success();
+    vmanager()
+        .args(["hook", "set"])
+        .arg(&tool)
+        .arg("tool")
+        .arg(&hook_script)
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success();
+
+    vmanager()
+        .args(["hook", "remove"])
+        .arg(&tool)
+        .arg("tool")
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("updated"));
+
+    let content = std::fs::read_to_string(tool.join("shim").join("tool.ps1")).unwrap();
+    assert!(!content.contains("$Hook"), "{content}");
+}
+
+#[test]
+fn removing_an_unconfigured_hook_is_not_found() {
+    let (dir, config) = isolated();
+    let tool = tool_folder(dir.path(), "node", &["18.20"]);
+
+    vmanager()
+        .args(["hook", "remove"])
+        .arg(&tool)
+        .arg("tool")
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .code(4);
+}
+
+#[test]
+fn hook_set_on_a_missing_script_is_not_found() {
+    let (dir, config) = isolated();
+    let tool = tool_folder(dir.path(), "node", &["18.20"]);
+
+    vmanager()
+        .args(["hook", "set"])
+        .arg(&tool)
+        .arg("tool")
+        .arg(dir.path().join("absent.ps1"))
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .code(4);
+}
+
+#[test]
+fn hook_list_shows_configured_hooks_and_can_be_narrowed_to_a_folder() {
+    let (dir, config) = isolated();
+    let node = tool_folder(dir.path(), "node", &["18.20"]);
+    let godot = tool_folder(dir.path(), "godot", &["4.1"]);
+    let hook_script = dir.path().join("hook.ps1");
+    std::fs::write(&hook_script, "# hook\n").unwrap();
+
+    for tool in [&node, &godot] {
+        vmanager()
+            .args(["hook", "set"])
+            .arg(tool)
+            .arg("tool")
+            .arg(&hook_script)
+            .arg("--config")
+            .arg(&config)
+            .assert()
+            .success();
+    }
+
+    vmanager()
+        .args(["hook", "list", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("node").and(predicate::str::contains("godot")));
+
+    vmanager()
+        .args(["hook", "list", "--folder"])
+        .arg(&node)
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("node"))
+        .stdout(predicate::str::contains("godot").not());
+}
+
+#[test]
+fn shim_list_shows_discovered_commands_and_hook_status() {
+    let (dir, config) = isolated();
+    let tool = tool_folder(dir.path(), "node", &["18.20"]);
+    let hook_script = dir.path().join("hook.ps1");
+    std::fs::write(&hook_script, "# hook\n").unwrap();
+
+    vmanager()
+        .arg("use")
+        .arg(&tool)
+        .arg("18.20")
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success();
+    vmanager()
+        .args(["hook", "set"])
+        .arg(&tool)
+        .arg("tool")
+        .arg(&hook_script)
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success();
+
+    let canonical_hook = hook_script.canonicalize().unwrap();
+    vmanager()
+        .args(["shim", "list", "--folder"])
+        .arg(&tool)
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("tool"))
+        .stdout(predicate::str::contains("hook:"))
+        .stdout(predicate::str::contains(
+            canonical_hook.display().to_string(),
+        ));
+}
+
+#[test]
+fn shim_regenerate_rebuilds_a_cleared_shim_directory() {
+    let (dir, config) = isolated();
+    let tool = tool_folder(dir.path(), "node", &["18.20"]);
+
+    vmanager()
+        .arg("use")
+        .arg(&tool)
+        .arg("18.20")
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success();
+    std::fs::remove_file(tool.join("shim").join("tool.ps1")).unwrap();
+    assert!(!tool.join("shim").join("tool.ps1").exists());
+
+    vmanager()
+        .args(["shim", "regenerate", "--folder"])
+        .arg(&tool)
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("created"));
+
+    assert!(tool.join("shim").join("tool.ps1").is_file());
+}
+
+#[test]
+fn a_same_folder_exe_name_collision_names_both_paths_and_exits_with_failure() {
+    let (dir, config) = isolated();
+    let tool = tool_folder(dir.path(), "node", &["18.20"]);
+    // Two exes that both resolve to the `node` command, in different bin
+    // directories under the same version.
+    std::fs::create_dir_all(tool.join("18.20").join("bin1")).unwrap();
+    std::fs::create_dir_all(tool.join("18.20").join("bin2")).unwrap();
+    std::fs::write(tool.join("18.20").join("bin1").join("node.exe"), b"a").unwrap();
+    std::fs::write(tool.join("18.20").join("bin2").join("node.exe"), b"b").unwrap();
+
+    vmanager()
+        .arg("use")
+        .arg(&tool)
+        .arg("18.20")
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .code(1)
+        .stderr(
+            predicate::str::contains("node")
+                .and(predicate::str::contains("bin1"))
+                .and(predicate::str::contains("bin2")),
+        );
+
+    // The link itself is still set — only the shim regeneration failed,
+    // loudly, after it.
+    assert_eq!(link::current(&tool).unwrap().as_deref(), Some("18.20"));
+}
+
+#[test]
+fn a_dry_run_sweep_does_not_regenerate_shims() {
+    let (dir, config) = isolated();
+    let tool = tool_folder(dir.path(), "node", &["18.20", "20.11"]);
+
+    vmanager()
+        .args(["folder", "add"])
+        .arg(&tool)
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success();
+    // Created empty by `folder add`; nothing has called `use` or a real
+    // `run` yet.
+    assert_eq!(std::fs::read_dir(tool.join("shim")).unwrap().count(), 0);
+
+    vmanager()
+        .args(["run", "--dry-run", "--config"])
+        .arg(&config)
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read_dir(tool.join("shim")).unwrap().count(),
+        0,
+        "a dry run must not write shim scripts either"
+    );
+}
+
+#[test]
+fn run_recovers_the_shim_after_the_active_version_gets_archived() {
+    let (dir, config) = isolated();
+    let tool = dir.path().join("node");
+    // Deliberately different layouts, so the shim content genuinely has to
+    // change when discovery falls back from one to the other.
+    std::fs::create_dir_all(tool.join("18.20")).unwrap();
+    std::fs::write(tool.join("18.20").join("tool.exe"), b"old").unwrap();
+    std::fs::create_dir_all(tool.join("20.11").join("bin")).unwrap();
+    std::fs::write(tool.join("20.11").join("bin").join("tool.exe"), b"new").unwrap();
+
+    vmanager()
+        .arg("use")
+        .arg(&tool)
+        .arg("18.20")
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success();
+    let before = std::fs::read_to_string(tool.join("shim").join("tool.ps1")).unwrap();
+    assert!(before.contains("current\\tool.exe"), "{before}");
+
+    vmanager()
+        .args(["folder", "add"])
+        .arg(&tool)
+        .arg("--config")
+        .arg(&config)
+        .arg("--keep")
+        .arg("1")
+        .assert()
+        .success();
+
+    // Keeping only the newest archives 18.20 — the very version `current`
+    // points at.
+    vmanager()
+        .args(["run", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("archived 18.20"));
+
+    // `current` is now dangling; discovery falls back to the newest
+    // unpacked version, 20.11, whose exe lives under `bin\` — and the shim
+    // is rewritten to match without anyone running `use` again first.
+    let after = std::fs::read_to_string(tool.join("shim").join("tool.ps1")).unwrap();
+    assert!(after.contains("current\\bin\\tool.exe"), "{after}");
 }

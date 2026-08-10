@@ -12,6 +12,7 @@ use crate::archive::{self, human_bytes};
 use crate::commands::Context;
 use crate::db::{Database, FolderRecord};
 use crate::error::{Error, Result};
+use crate::shim;
 use crate::sweep::{self, Outcome};
 
 #[derive(Debug, clap::Args)]
@@ -98,11 +99,28 @@ pub fn run(args: &Args, ctx: &Context) -> Result<()> {
             .or_else(|| target.record.as_ref().and_then(|record| record.keep))
             .unwrap_or(default_keep);
 
-        if let Err(err) = sweep_folder(ctx, &db, target, keep, &options, &mut totals) {
-            // Report and carry on: the next folder may be perfectly healthy.
-            tracing::error!(folder = %target.path.display(), error = %err, "sweep failed");
-            eprintln!("error: {}: {err}", target.path.display());
-            totals.failed += 1;
+        match sweep_folder(ctx, &db, target, keep, &options, &mut totals) {
+            Ok(()) => {
+                // Not under `--dry-run`, which must leave the disk exactly
+                // as it found it. Regenerated even when nothing was
+                // archived this run: the active version could have been
+                // swept out from under `current` by an earlier `--keep`
+                // change or a manual archive, and this is the one place
+                // that notices and recovers from that on its own.
+                if !args.dry_run
+                    && let Err(err) = regenerate_shims(ctx, &db, target)
+                {
+                    tracing::error!(folder = %target.path.display(), error = %err, "shim regeneration failed");
+                    eprintln!("error: {}: {err}", target.path.display());
+                    totals.failed += 1;
+                }
+            }
+            Err(err) => {
+                // Report and carry on: the next folder may be perfectly healthy.
+                tracing::error!(folder = %target.path.display(), error = %err, "sweep failed");
+                eprintln!("error: {}: {err}", target.path.display());
+                totals.failed += 1;
+            }
         }
     }
 
@@ -237,6 +255,26 @@ fn sweep_folder(
         }
     }
 
+    Ok(())
+}
+
+/// Rebuild a target's `shim\` against whatever `current` (or, lacking that,
+/// the newest unpacked version) now contains.
+fn regenerate_shims(ctx: &Context, db: &Database, target: &Target) -> Result<()> {
+    let hooks = db
+        .hooks_for_folder(&target.path)?
+        .into_iter()
+        .map(|hook| (hook.command, hook.script_path))
+        .collect();
+
+    let reports = shim::write_shims(&target.path, &hooks)?;
+    if !ctx.is_quiet() && !reports.is_empty() {
+        writeln!(
+            std::io::stdout().lock(),
+            "  shim: {} command(s)",
+            reports.len()
+        )?;
+    }
     Ok(())
 }
 

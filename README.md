@@ -39,6 +39,7 @@ vmanager list                            # see what you have
 vmanager run --dry-run                   # see what would be archived
 vmanager run                             # do it
 vmanager use C:\Tools\Blender 4.3        # point `current` at a version
+vmanager hook set C:\Tools\Blender launch C:\hooks\log.ps1
 vmanager schedule install                # …and every day at 03:00
 vmanager completions powershell          # complete commands as you type them
 ```
@@ -60,6 +61,11 @@ vmanager [OPTIONS] <COMMAND>
 | `use <FOLDER> <VERSION>` | Point `<FOLDER>\current` at a version |
 | `use <FOLDER>` | Show which version `<FOLDER>\current` points at |
 | `use <FOLDER> --clear` | Remove the `current` link |
+| `shim list [--folder <FOLDER>]` | Show every shim, its target exe and its hook |
+| `shim regenerate [--folder <FOLDER>]` | Re-scan and rewrite a folder's shims |
+| `hook set <FOLDER> <COMMAND> <SCRIPT>` | Run `<SCRIPT>` before `<COMMAND>` launches |
+| `hook remove <FOLDER> <COMMAND>` | Remove a configured hook |
+| `hook list [--folder <FOLDER>]` | Show configured hooks |
 | `schedule install` | Register the daily run with Windows Task Scheduler |
 | `schedule uninstall` | Remove the scheduled task |
 | `schedule status` | Show the scheduled task |
@@ -183,10 +189,14 @@ component, compared numerically, so `4.9` is older than `4.10` — the answer a
 string sort gets wrong. `v4.2`, `4_2`, `Blender-4.2` and `2026-08-04` all
 parse.
 
-A folder whose name contains no digits at all is *not* a version: `current\`
-and `.cache\` are neither counted nor archived. The exception is a registered
-folder where nothing is numbered — there vManager falls back to modification
-time and treats every subfolder as a version, so tools versioned by
+A folder whose name contains no digits at all is *not* a version. `current\`
+(vManager's own link, see [below](#selecting-a-version)) and `shim\` (its
+generated [command shims](#command-shims)) are never counted or archived,
+full stop — even in a registered folder where nothing else is numbered
+either. Any other undigited name, like a `.cache\` a tool drops next to its
+versions, is excluded the same way whenever at least one sibling *is*
+numbered. A folder where *nothing* is numbered falls back to modification
+time and treats every remaining subfolder as a version, so tools versioned by
 date-of-copy still work.
 
 Symlinks and junctions are skipped, files are ignored, and the `.7z` files from
@@ -242,6 +252,72 @@ was set to, so a stale link is visible rather than silent.
 
 pManager pins a project to a version this way — see its own README for the
 `pmanager project set-version` / `pmanager use` half of this.
+
+### Command shims
+
+Every registered folder gets its own `shim\` subfolder, sitting next to its
+version folders and `current`:
+
+```
+C:\Tools\nodejs\
+  22.16.0\
+  22.23.2\
+  24.18.0\
+  current -> 24.18.0
+  shim\
+    node.ps1
+    npm.ps1
+    npx.ps1
+```
+
+`shim\` is created empty the moment `vmanager folder add` runs. It is
+populated the first time `vmanager use` or `vmanager run` has something to
+scan — one `<command>.ps1` per `.exe` found under `current` (or, lacking
+that, the newest unpacked version), recursing into subfolders like `bin\`.
+Put `C:\Tools\nodejs\shim` on `PATH` once, and every later `vmanager use
+nodejs <version>` changes what `node`, `npm` and `npx` run without touching
+`PATH` again — nothing here modifies `PATH` for you.
+
+That last part is the reason a version switch does not rewrite the shims: a
+`.ps1` resolves its target through `<folder>\current\...` *at run time*, not
+a path baked in for one version, so retargeting the `current` junction is
+enough on its own. Regeneration — rewriting which `.ps1` files exist and
+what is in them — only happens when the *set* of exe names could have
+changed: after `vmanager use`, after `vmanager run` (in case the version
+`current` pointed at was itself archived), or on demand:
+
+```sh
+vmanager shim list                       # every shim, its target, its hook
+vmanager shim list --folder C:\Tools\nodejs
+vmanager shim regenerate                 # manual re-scan/rewrite, for recovery
+```
+
+Regeneration diffs against what is already there rather than clobbering it:
+a script you dropped into `shim\` by hand, even one whose name collides with
+a discovered command, is left alone — only files vManager itself generated
+(marked as such in their header) are rewritten or removed. Two executables
+under the same active version that would produce the same command name is
+reported as an error naming both paths, rather than silently picking one.
+
+#### Pre-hooks
+
+A shim can run a script before its command — logging, environment setup,
+whatever — and abort loudly, without launching the real exe, if that script
+exits non-zero:
+
+```sh
+vmanager hook set C:\Tools\nodejs node C:\hooks\node-setup.ps1
+vmanager hook remove C:\Tools\nodejs node
+vmanager hook list
+vmanager hook list --folder C:\Tools\nodejs
+```
+
+Hooks are keyed by `(folder, command)`, not by command name alone, since the
+same command (`node`) can exist under two different registered folders with
+two different hooks. Setting one before its shim exists is fine — it takes
+effect the moment discovery creates the shim; setting or clearing one on a
+shim that already exists patches that single `.ps1` immediately, so a hook
+change is never silently stale until the next `use` or `run`.
 
 ## Scheduling the daily run
 
@@ -313,13 +389,17 @@ has shipped.
 Connections open with WAL journaling, `foreign_keys = ON` and a 5 second busy
 timeout, so a second `vmanager` waits its turn instead of failing.
 
-Two tables: `folders` is the registry `vmanager run` walks, and `archives`
-records every `.7z` written, pointing back at the folder it came from. The
-archive records are what let `vmanager list` report a version's original size
-— the one thing a `.7z` cannot tell you by looking at it.
-Unregistering a folder clears that back-reference (`ON DELETE SET NULL`) rather
-than discarding the archive records — the files are still on disk, so their
-history should not vanish with the registration.
+Three tables: `folders` is the registry `vmanager run` walks; `archives`
+records every `.7z` written, pointing back at the folder it came from; `hooks`
+holds one row per `(folder, command)` pre-hook `vmanager hook set` has
+configured. The archive records are what let `vmanager list` report a
+version's original size — the one thing a `.7z` cannot tell you by looking at
+it. Unregistering a folder clears the archives' back-reference (`ON DELETE SET
+NULL`) rather than discarding the records — the files are still on disk, so
+their history should not vanish with the registration; `hooks` rows are keyed
+by the folder's path rather than a foreign key to `folders` at all, so a hook
+can be configured (and a shim built) for a folder that was never registered,
+same as `vmanager use` and `vmanager run --folder` already allow.
 
 The database is a record, not the source of truth: the archives and version
 folders on disk are. Deleting the database loses the history, not the versions.
@@ -369,6 +449,7 @@ src/
   sweep.rs            the keep-newest-N policy: plan, archive, verify, delete
   archive.rs          7z creation: walking, filtering, compression
   link.rs             the `current` junction/symlink `use` points and reads
+  shim.rs             discovering exes, writing shims, hook patching — filesystem-only
   db.rs               SQLite connection, migrations and queries
   config.rs           config file discovery, parsing and defaults
   error.rs            error type and its exit-code mapping
@@ -379,16 +460,21 @@ src/
     list.rs           `vmanager list`
     folder.rs         `vmanager folder`
     use.rs            `vmanager use`
+    shim.rs           `vmanager shim`
+    hook.rs           `vmanager hook`
     schedule.rs       `vmanager schedule`
     completions.rs    `vmanager completions`
 tests/
   cli.rs              end-to-end tests that run the built binary
 ```
 
-`version.rs` and `sweep.rs` hold the policy and are filesystem-only: no
-database, no printing, no clap. That is what lets the ordering rules and the
-archive-then-delete sequence be tested directly, and it keeps `commands/run.rs`
-down to gathering settings, looping and reporting.
+`version.rs`, `sweep.rs` and `shim.rs` hold policy and stay filesystem-only: no
+database, no printing, no clap. That is what lets the ordering rules, the
+archive-then-delete sequence and shim discovery/regeneration be tested
+directly, and it keeps `commands/run.rs` and `commands/shim.rs` down to
+gathering settings, looping and reporting. `commands/hook.rs` is the thin CLI
+layer over the `hooks` table the same way `commands/folder.rs` is over
+`folders` — the database query lives in `db.rs`, not there.
 
 `main.rs` is deliberately thin: the logic lives in the library so tests and any
 future front-end can drive it without a process boundary.
