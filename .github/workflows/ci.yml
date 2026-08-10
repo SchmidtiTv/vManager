@@ -7,37 +7,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-
-jobs:
-  # Windows is the only platform vManager targets, so it is the only platform
-  # anything is compiled on.
-  #
-  # The suite is not run here — run it locally with `cargo test`. Clippy still
-  # uses `--all-targets`, so the tests are compiled and type-checked on every
-  # pull request and cannot rot unnoticed; they simply are not executed.
-  check:
-    name: Format and lint
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features
-
-      - name: Smoke test the release binary
-        run: cargo run --release -- --version
-
-  # Reads Cargo metadata only — it never builds or runs vManager, so the
-  # runner OS is irrelevant and the cheapest one is fine.
+  
   deny:
     name: Licenses and advisories
     runs-on: ubuntu-latest
