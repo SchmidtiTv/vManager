@@ -13,6 +13,7 @@ use crate::archive::{self, human_bytes};
 use crate::commands::Context;
 use crate::db::Database;
 use crate::error::Result;
+use crate::link;
 use crate::version::{self, Version};
 
 #[derive(Debug, clap::Args)]
@@ -121,6 +122,11 @@ pub fn run(args: &Args, ctx: &Context) -> Result<()> {
             continue;
         }
 
+        // Read once per folder rather than once per entry: a link that has
+        // gone stale (its version since archived) still names a version, and
+        // that name only needs comparing against what is actually shown.
+        let current = link::current(path)?;
+
         let width = shown
             .iter()
             .map(|entry| entry.name.chars().count())
@@ -130,7 +136,15 @@ pub fn run(args: &Args, ctx: &Context) -> Result<()> {
         for entry in &shown {
             write!(out, "  {:<width$}  ", entry.name)?;
             match &entry.detail {
-                Detail::Unpacked => writeln!(out, "unpacked")?,
+                Detail::Unpacked => writeln!(
+                    out,
+                    "unpacked{}",
+                    if current.as_deref() == Some(entry.name.as_str()) {
+                        "  (current)"
+                    } else {
+                        ""
+                    }
+                )?,
                 Detail::Archived { bytes, original } => {
                     write!(out, "archived  {:>9}", human_bytes(*bytes))?;
                     match original {
