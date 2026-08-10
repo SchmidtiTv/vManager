@@ -16,6 +16,7 @@ Getting started:
   vmanager list                           See what each folder holds
   vmanager run --dry-run                  See what would be archived
   vmanager run                            Archive all but the newest versions
+  vmanager use C:\\Tools\\Blender 4.3      Point `current` at a version
   vmanager schedule install               Run it daily at 03:00
   vmanager completions --help             Complete commands as you type them
 
@@ -143,6 +144,9 @@ pub enum Command {
 
     /// Register the folders that `vmanager run` sweeps
     Folder(crate::commands::folder::Args),
+
+    /// Point a folder's `current` link at one of its versions
+    Use(crate::commands::r#use::Args),
 
     /// Install or remove the scheduled daily run
     Schedule(crate::commands::schedule::Args),

@@ -6,6 +6,7 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use vmanager::link;
 
 /// A `vmanager` invocation with a clean environment.
 fn vmanager() -> Command {
@@ -794,4 +795,143 @@ fn list_survives_a_folder_that_has_gone_missing() {
         .assert()
         .success()
         .stdout(predicate::str::contains("unavailable"));
+}
+
+// --- the `current` link -----------------------------------------------------
+
+#[test]
+fn use_points_current_at_a_version_and_reports_it_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool = tool_folder(dir.path(), "node", &["18.20", "20.11"]);
+
+    vmanager()
+        .arg("use")
+        .arg(&tool)
+        .arg("20.11")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("current"))
+        .stdout(predicate::str::contains("20.11"));
+
+    // Asking again with no version reports what it is currently set to.
+    vmanager()
+        .arg("use")
+        .arg(&tool)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("20.11"));
+
+    // `list` marks the entry it points at.
+    vmanager()
+        .args(["list", "--folder"])
+        .arg(&tool)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("20.11").and(predicate::str::contains("(current)")))
+        .stdout(predicate::str::contains("18.20  unpacked\n"));
+}
+
+#[test]
+fn use_can_be_repointed_and_then_cleared() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool = tool_folder(dir.path(), "node", &["18.20", "20.11"]);
+
+    vmanager()
+        .arg("use")
+        .arg(&tool)
+        .arg("18.20")
+        .assert()
+        .success();
+    vmanager()
+        .arg("use")
+        .arg(&tool)
+        .arg("20.11")
+        .assert()
+        .success();
+
+    vmanager()
+        .arg("use")
+        .arg(&tool)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("20.11"));
+
+    vmanager()
+        .arg("use")
+        .arg(&tool)
+        .arg("--clear")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cleared"));
+
+    vmanager()
+        .arg("use")
+        .arg(&tool)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no current link"));
+}
+
+#[test]
+fn use_on_a_version_that_does_not_exist_is_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool = tool_folder(dir.path(), "node", &["18.20"]);
+
+    vmanager()
+        .arg("use")
+        .arg(&tool)
+        .arg("99.0")
+        .assert()
+        .code(4);
+}
+
+#[test]
+fn use_and_a_version_number_conflict_with_clear() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool = tool_folder(dir.path(), "node", &["18.20"]);
+
+    vmanager()
+        .arg("use")
+        .arg(&tool)
+        .arg("18.20")
+        .arg("--clear")
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn the_current_link_is_not_swept_as_a_version() {
+    let (dir, config) = isolated();
+    let tool = tool_folder(dir.path(), "node", &["18.20", "20.11"]);
+
+    // Points at the version that will survive the sweep, so the assertions
+    // below aren't tangled up with the link going stale too.
+    vmanager()
+        .arg("use")
+        .arg(&tool)
+        .arg("20.11")
+        .assert()
+        .success();
+
+    vmanager()
+        .args(["folder", "add"])
+        .arg(&tool)
+        .arg("--config")
+        .arg(&config)
+        .arg("--keep")
+        .arg("1")
+        .assert()
+        .success();
+
+    // Sweeping with keep=1 archives the single oldest *version* — the
+    // `current` link sitting beside them must never be mistaken for one.
+    vmanager()
+        .args(["run", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("archived 18.20"));
+
+    assert_eq!(link::current(&tool).unwrap().as_deref(), Some("20.11"));
+    assert!(tool.join("20.11").is_dir());
 }

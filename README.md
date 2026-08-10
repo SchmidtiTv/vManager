@@ -38,6 +38,7 @@ vmanager folder add C:\Tools\Godot --keep 3
 vmanager list                            # see what you have
 vmanager run --dry-run                   # see what would be archived
 vmanager run                             # do it
+vmanager use C:\Tools\Blender 4.3        # point `current` at a version
 vmanager schedule install                # …and every day at 03:00
 vmanager completions powershell          # complete commands as you type them
 ```
@@ -56,6 +57,9 @@ vmanager [OPTIONS] <COMMAND>
 | `list` | Show every version of every registered folder |
 | `folder add <FOLDER>` | Register a folder whose versions should be managed |
 | `folder remove <FOLDER>` | Unregister a folder; nothing on disk is touched |
+| `use <FOLDER> <VERSION>` | Point `<FOLDER>\current` at a version |
+| `use <FOLDER>` | Show which version `<FOLDER>\current` points at |
+| `use <FOLDER> --clear` | Remove the `current` link |
 | `schedule install` | Register the daily run with Windows Task Scheduler |
 | `schedule uninstall` | Remove the scheduled task |
 | `schedule status` | Show the scheduled task |
@@ -211,6 +215,34 @@ One folder failing does not stop the others: an unplugged drive is reported,
 the remaining folders are still swept, and the run ends with a non-zero exit
 code so a failed scheduled run is visible in Task Scheduler's history.
 
+### Selecting a version
+
+`vmanager use` points a registered folder's `current` at one of its versions —
+a directory junction on Windows, a symlink everywhere else — so a fixed path
+put on `PATH` once always resolves to whichever version was selected last:
+
+```sh
+vmanager use C:\Tools\Node 20.11    # C:\Tools\Node\current -> C:\Tools\Node\20.11
+vmanager use C:\Tools\Node          # show what current points at
+vmanager use C:\Tools\Node --clear  # remove the link
+```
+
+Put `C:\Tools\Node\current` on `PATH` and every later `vmanager use` retargets
+what that path resolves to. That is the whole point of a link rather than
+editing `PATH` itself: a new process sees the change immediately, without a
+fresh shell to pick up an updated environment variable.
+
+A junction rather than a Windows symlink: a symlink to a directory needs
+Developer Mode or an elevated prompt, a junction needs neither. `current` is
+never itself treated as a version — see [above](#which-version-is-oldest) — so
+it is never archived, and pointing it at something that does not exist is
+refused rather than left dangling. Once a version it points at *has* been
+archived, `vmanager list` and `vmanager use <FOLDER>` still report the name it
+was set to, so a stale link is visible rather than silent.
+
+pManager pins a project to a version this way — see its own README for the
+`pmanager project set-version` / `pmanager use` half of this.
+
 ## Scheduling the daily run
 
 vManager has no resident daemon. `schedule install` hands `vmanager run` to
@@ -336,6 +368,7 @@ src/
   version.rs          finding version folders and ordering them oldest first
   sweep.rs            the keep-newest-N policy: plan, archive, verify, delete
   archive.rs          7z creation: walking, filtering, compression
+  link.rs             the `current` junction/symlink `use` points and reads
   db.rs               SQLite connection, migrations and queries
   config.rs           config file discovery, parsing and defaults
   error.rs            error type and its exit-code mapping
@@ -345,6 +378,7 @@ src/
     run.rs            `vmanager run`
     list.rs           `vmanager list`
     folder.rs         `vmanager folder`
+    use.rs            `vmanager use`
     schedule.rs       `vmanager schedule`
     completions.rs    `vmanager completions`
 tests/
