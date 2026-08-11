@@ -1042,6 +1042,60 @@ fn use_populates_a_shim_for_every_discovered_exe() {
 }
 
 #[test]
+fn use_shims_ps1_bat_sh_and_zsh_scripts_alongside_exes() {
+    let (dir, config) = isolated();
+    let tool = dir.path().join("mixed");
+    let version = tool.join("1.0");
+    std::fs::create_dir_all(&version).unwrap();
+    std::fs::write(version.join("tool.exe"), b"exe").unwrap();
+    std::fs::write(version.join("deploy.ps1"), b"# deploy").unwrap();
+    std::fs::write(version.join("build.bat"), b"@echo build").unwrap();
+    std::fs::write(version.join("install.sh"), b"#!/bin/sh\necho install").unwrap();
+    std::fs::write(version.join("setup.zsh"), b"#!/bin/zsh\necho setup").unwrap();
+
+    vmanager()
+        .arg("use")
+        .arg(&tool)
+        .arg("1.0")
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success();
+
+    let shim_dir = tool.join("shim");
+    for command in ["tool", "deploy", "build", "install", "setup"] {
+        assert!(
+            shim_dir.join(format!("{command}.ps1")).is_file(),
+            "expected a shim for {command}"
+        );
+    }
+
+    let sh_shim = std::fs::read_to_string(shim_dir.join("install.ps1")).unwrap();
+    assert!(
+        sh_shim.contains("& bash $Exe @args"),
+        "a .sh target should be launched through bash: {sh_shim}"
+    );
+
+    let zsh_shim = std::fs::read_to_string(shim_dir.join("setup.ps1")).unwrap();
+    assert!(
+        zsh_shim.contains("& zsh $Exe @args"),
+        "a .zsh target should be launched through zsh: {zsh_shim}"
+    );
+
+    let ps1_shim = std::fs::read_to_string(shim_dir.join("deploy.ps1")).unwrap();
+    assert!(
+        ps1_shim.contains("& $Exe @args"),
+        "a .ps1 target should be launched directly: {ps1_shim}"
+    );
+
+    let bat_shim = std::fs::read_to_string(shim_dir.join("build.ps1")).unwrap();
+    assert!(
+        bat_shim.contains("& $Exe @args"),
+        "a .bat target should be launched directly: {bat_shim}"
+    );
+}
+
+#[test]
 fn switching_to_a_version_with_the_same_exe_set_does_not_rewrite_the_shim() {
     let (dir, config) = isolated();
     let tool = tool_folder(dir.path(), "node", &["18.20", "20.11"]);

@@ -25,7 +25,7 @@ pub struct Args {
 
 #[derive(Debug, clap::Subcommand)]
 enum ShimCommand {
-    /// Show every shim, its target exe and whether a hook is attached
+    /// Show every shim, its target and whether a hook is attached
     List {
         /// List only this folder; repeatable [default: every registered folder]
         #[arg(long, value_name = "FOLDER")]
