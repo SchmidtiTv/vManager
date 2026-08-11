@@ -54,6 +54,11 @@ const SHIM_EXTENSION: &str = "ps1";
 /// directly) is decided by [`interpreter_for`].
 const TARGET_EXTENSIONS: &[&str] = &["exe", "ps1", "bat", "sh", "zsh"];
 
+/// Directory name [`discover`] never recurses into — see its doc comment
+/// for why a dependency's own `node_modules` tree is not a source of
+/// top-level shim targets.
+const NODE_MODULES_DIR_NAME: &str = "node_modules";
+
 /// One executable or script discovered under a folder's active version —
 /// see [`TARGET_EXTENSIONS`] for which file types qualify.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,11 +139,22 @@ pub fn active_root(folder: &Path) -> Result<Option<PathBuf>> {
 /// active version.
 ///
 /// Recurses into subdirectories (a `bin\` layout is common) but skips the
-/// `shim\` directory itself and any `.7z` file. A symlinked entry is neither
-/// a directory nor a file to `DirEntry::file_type`, so — same as
-/// [`crate::archive`]'s walk and [`version::list`] — it is silently skipped
-/// rather than followed, which also keeps a stray `current` reached while
-/// walking a date-versioned tool from being descended into twice.
+/// `shim\` directory itself, any `node_modules\` directory, and any `.7z`
+/// file. A symlinked entry is neither a directory nor a file to
+/// `DirEntry::file_type`, so — same as [`crate::archive`]'s walk and
+/// [`version::list`] — it is silently skipped rather than followed, which
+/// also keeps a stray `current` reached while walking a date-versioned tool
+/// from being descended into twice.
+///
+/// `node_modules` is skipped because it holds a dependency's own packaging,
+/// not the tool's top-level binaries: Node ships `corepack.ps1` (among
+/// others) both at the install root and again inside
+/// `node_modules\corepack\shims\`, in two variants (`shims\corepack.ps1` and
+/// `shims\nodewin\corepack.ps1`) that exist for npm's own use on other
+/// platforms and shells, not to be discovered as a second `corepack` command
+/// here. Walking into `node_modules` at all risks exactly that kind of
+/// same-stem duplicate — or an unrelated package's `bin` entry — several
+/// layers below the binaries a folder was actually registered for.
 ///
 /// Two targets that resolve to the same command name is a same-folder
 /// collision: rare, but real (a tool that ships two same-named binaries
@@ -160,6 +176,9 @@ pub fn discover(folder: &Path) -> Result<Vec<ExeEntry>> {
             let path = entry.path();
 
             if entry.file_name().to_string_lossy() == SHIM_DIR_NAME {
+                continue;
+            }
+            if entry.file_name().to_string_lossy() == NODE_MODULES_DIR_NAME {
                 continue;
             }
 
@@ -587,6 +606,29 @@ mod tests {
 
         let entries = discover(&root).unwrap();
         assert_eq!(commands(&entries), ["tool"]);
+    }
+
+    #[test]
+    fn node_modules_is_never_recursed_into() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = tool(dir.path(), "1.0", &["node.exe"], Some("1.0"));
+
+        // Real-world shape reported against corepack: the package's own
+        // `shims\` directory ships `corepack.ps1` twice — once directly and
+        // once again under `nodewin\` — both nested under `node_modules`.
+        // Before this fix that was a same-folder collision on every
+        // `shim regenerate`; now neither is even discovered.
+        write_exes(
+            &root.join(link::LINK_NAME),
+            &[
+                "node_modules\\corepack\\shims\\corepack.ps1",
+                "node_modules\\corepack\\shims\\nodewin\\corepack.ps1",
+                "node_modules\\.bin\\some-tool.exe",
+            ],
+        );
+
+        let entries = discover(&root).unwrap();
+        assert_eq!(commands(&entries), ["node"]);
     }
 
     #[test]
