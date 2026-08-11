@@ -14,6 +14,7 @@ use crate::archive;
 use crate::commands::Context;
 use crate::error::Result;
 use crate::link;
+use crate::shim;
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -69,6 +70,35 @@ pub fn run(args: &Args, ctx: &Context) -> Result<()> {
     if !ctx.is_quiet() {
         writeln!(out, "{} -> {version}", target.display())?;
     }
+
+    // The exe set behind `current` could have changed shape (a version with
+    // a different `bin\` layout, or a tool that dropped/added a binary), so
+    // the shims are regenerated here rather than left to the next `run` —
+    // not because retargeting `current` itself needs it: the junction
+    // already makes every existing shim resolve to the new version for free.
+    regenerate_shims(ctx, &folder)?;
+
+    Ok(())
+}
+
+/// Rebuild `<folder>/shim/` against whatever `current` (or, lacking that,
+/// the newest unpacked version) now contains.
+fn regenerate_shims(ctx: &Context, folder: &std::path::Path) -> Result<()> {
+    let db = ctx.open_database()?;
+    let hooks = db
+        .hooks_for_folder(folder)?
+        .into_iter()
+        .map(|hook| (hook.command, hook.script_path))
+        .collect();
+
+    let reports = shim::write_shims(folder, &hooks)?;
+    if !ctx.is_quiet() && !reports.is_empty() {
+        writeln!(
+            std::io::stdout().lock(),
+            "  shim: {} command(s)",
+            reports.len()
+        )?;
+    }
     Ok(())
 }
 
@@ -77,11 +107,21 @@ mod tests {
     use super::*;
     use crate::cli::GlobalArgs;
 
-    fn ctx() -> Context {
+    /// A `Context` whose database lives under `root` rather than the real
+    /// platform data directory — `run` now opens the database (to regenerate
+    /// shims) even when setting a version, not just when it needs to look up
+    /// a hook, so every test driving `run` needs one of these.
+    fn ctx(root: &std::path::Path) -> Context {
+        let config = root.join("config.toml");
+        std::fs::write(
+            &config,
+            format!("data_dir = '{}'\n", root.join("data").display()),
+        )
+        .unwrap();
         Context::new(GlobalArgs {
             verbose: 0,
             quiet: false,
-            config: None,
+            config: Some(config),
             color: crate::cli::ColorChoice::Never,
         })
     }
@@ -134,7 +174,7 @@ mod tests {
                 target: Some("4.2".into()),
                 clear: false,
             },
-            &ctx(),
+            &ctx(dir.path()),
         )
         .unwrap();
 
@@ -148,7 +188,7 @@ mod tests {
                 target: None,
                 clear: false,
             },
-            &ctx(),
+            &ctx(dir.path()),
         )
         .unwrap();
     }
@@ -164,7 +204,7 @@ mod tests {
                 target: Some("4.1".into()),
                 clear: false,
             },
-            &ctx(),
+            &ctx(dir.path()),
         )
         .unwrap();
 
@@ -174,7 +214,7 @@ mod tests {
                 target: None,
                 clear: true,
             },
-            &ctx(),
+            &ctx(dir.path()),
         )
         .unwrap();
 

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::archive;
 use crate::commands::Context;
 use crate::error::Result;
+use crate::shim;
 use crate::version;
 
 #[derive(Debug, clap::Args)]
@@ -51,6 +52,11 @@ fn add(ctx: &Context, folder: &Path, keep: Option<u32>) -> Result<()> {
     let path = archive::canonical_dir(folder)?;
     let db = ctx.open_database()?;
     let (_, inserted) = db.add_folder(&path, keep)?;
+
+    // Created empty, alongside the version folders, so the folder is ready
+    // for `vmanager use`/`vmanager run` to populate the moment either runs —
+    // and so the path exists for a user to put on `PATH` right away.
+    shim::ensure_dir(&path)?;
 
     if ctx.is_quiet() {
         return Ok(());

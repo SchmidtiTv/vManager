@@ -20,6 +20,28 @@ use std::time::SystemTime;
 
 use crate::archive::EXTENSION;
 use crate::error::{Error, Result};
+use crate::link;
+
+/// Name of the per-folder directory [`crate::shim`] writes generated command
+/// shims into. Defined here rather than in `shim.rs` so [`RESERVED_NAMES`]
+/// can use it without `version.rs` depending on `shim.rs` (which itself
+/// depends on `version.rs` for the newest-unpacked-version fallback — a
+/// dependency the other way round would be a cycle).
+pub const SHIM_DIR_NAME: &str = "shim";
+
+/// Directory names that are never treated as a version, no matter which
+/// branch [`sort`] takes.
+///
+/// `current` is usually skipped earlier as a symlink or junction (see the
+/// "skipping symlink" case in [`list`]), which already covers the common
+/// case in both the numbered and unnumbered branches. But a `current` that
+/// is a plain directory — left over from an older vManager, or created by
+/// hand — and `shim`, which is always a plain directory, only get the
+/// no-digits-means-ignored treatment in the *numbered* branch of [`sort`];
+/// a folder that versions entirely by date has no numbered branch to fall
+/// into, and would otherwise treat either name as just another version to
+/// sweep. This set closes that gap for both branches.
+pub const RESERVED_NAMES: &[&str] = &[link::LINK_NAME, SHIM_DIR_NAME];
 
 /// A version number extracted from a folder name.
 ///
@@ -245,12 +267,19 @@ pub fn archived(root: &Path) -> Result<Vec<ArchivedVersion>> {
 ///
 /// Split out from [`list`] so the ordering rules can be tested without
 /// touching the filesystem.
-fn sort(mut candidates: Vec<VersionFolder>) -> Listing {
+fn sort(candidates: Vec<VersionFolder>) -> Listing {
+    // Pulled out before the numbered/unnumbered decision below, so a
+    // reserved name is excluded either way — see [`RESERVED_NAMES`].
+    let (candidates, reserved): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|entry| !RESERVED_NAMES.contains(&entry.name.as_str()));
+
     let numbered = candidates.iter().any(|entry| entry.version.is_some());
 
     if !numbered {
-        // Nothing is numbered: this folder versions by date, so every child
-        // counts and modification time decides.
+        // Nothing is numbered: this folder versions by date, so every
+        // remaining child counts and modification time decides.
+        let mut candidates = candidates;
         candidates.sort_by(|a, b| {
             a.modified
                 .cmp(&b.modified)
@@ -258,7 +287,7 @@ fn sort(mut candidates: Vec<VersionFolder>) -> Listing {
         });
         return Listing {
             versions: candidates,
-            ignored: Vec::new(),
+            ignored: reserved.into_iter().map(|entry| entry.path).collect(),
             order: OrderKey::Modified,
         };
     }
@@ -269,9 +298,13 @@ fn sort(mut candidates: Vec<VersionFolder>) -> Listing {
 
     versions.sort_by(compare);
 
+    let mut ignored: Vec<PathBuf> = ignored.into_iter().map(|entry| entry.path).collect();
+    ignored.extend(reserved.into_iter().map(|entry| entry.path));
+    ignored.sort();
+
     Listing {
         versions,
-        ignored: ignored.into_iter().map(|entry| entry.path).collect(),
+        ignored,
         order: OrderKey::Version,
     }
 }
@@ -403,6 +436,42 @@ mod tests {
         assert_eq!(listing.order, OrderKey::Modified);
         assert_eq!(names(&listing), ["oldest", "middle", "newest"]);
         assert!(listing.ignored.is_empty());
+    }
+
+    #[test]
+    fn reserved_names_are_ignored_even_when_nothing_is_numbered() {
+        // The gap this closes: a folder that versions entirely by date has no
+        // numbered sibling to route `current`/`shim` into `ignored` via the
+        // "no digits" rule, so without this they would be swept up as
+        // versions themselves — and, for `shim`, eventually archived away.
+        let listing = sort(vec![
+            folder("current", 500),
+            folder("shim", 50),
+            folder("oldest", 100),
+            folder("newest", 200),
+        ]);
+
+        assert_eq!(listing.order, OrderKey::Modified);
+        assert_eq!(names(&listing), ["oldest", "newest"]);
+        assert_eq!(
+            listing.ignored,
+            [
+                PathBuf::from("/tools/current"),
+                PathBuf::from("/tools/shim")
+            ]
+        );
+    }
+
+    #[test]
+    fn reserved_names_are_ignored_alongside_numbered_versions() {
+        let listing = sort(vec![
+            folder("shim", 500),
+            folder("4.1", 100),
+            folder("4.2", 200),
+        ]);
+
+        assert_eq!(names(&listing), ["4.1", "4.2"]);
+        assert_eq!(listing.ignored, [PathBuf::from("/tools/shim")]);
     }
 
     #[test]
