@@ -643,6 +643,121 @@ fn the_archive_of_a_swept_version_restores_it() {
     );
 }
 
+// --- coordinating with pManager ----------------------------------------------
+
+/// Puts a fake `pmanager` on `PATH` that answers `pmanager pins --json` with
+/// `pins_json` regardless of what it is actually called with — enough to
+/// drive `vmanager run`'s side of the integration without a real pManager
+/// installed. Returns the `PATH` to hand to the child process.
+#[cfg(unix)]
+fn fake_pmanager(dir: &std::path::Path, pins_json: &str) -> std::ffi::OsString {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = bin.join("pmanager");
+    {
+        let mut file = std::fs::File::create(&script).unwrap();
+        writeln!(file, "#!/bin/sh\ncat <<'PINS'\n{pins_json}\nPINS").unwrap();
+    }
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut path = std::ffi::OsString::from(bin.as_os_str());
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn a_version_pinned_by_pmanager_is_kept_even_after_it_ages_out() {
+    let (dir, config) = isolated();
+    let tool = tool_folder(dir.path(), "node", &["18.20", "20.11", "22.16"]);
+    // The database stores canonicalized paths; the pin must be spelled the
+    // same way for the two to line up.
+    let tool = tool.canonicalize().unwrap();
+
+    let pins = format!(
+        r#"{{"pins": [{{"folder": "{}", "version": "18.20", "project": "legacy-tool"}}]}}"#,
+        tool.display()
+    );
+    let path = fake_pmanager(dir.path(), &pins);
+
+    vmanager()
+        .args(["run", "--keep", "1", "--folder"])
+        .arg(&tool)
+        .arg("--config")
+        .arg(&config)
+        .env("PATH", &path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "keeping 18.20 (pinned by pmanager: legacy-tool)",
+        ))
+        .stdout(predicate::str::contains("archived 20.11"))
+        .stdout(predicate::str::contains(
+            "1 archived, 0 skipped, 1 protected",
+        ));
+
+    assert!(
+        tool.join("18.20").is_dir(),
+        "the pinned version must survive the sweep"
+    );
+    assert!(!tool.join("20.11").exists());
+    assert!(tool.join("22.16").is_dir(), "the newest is kept regardless");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pin_for_a_different_folder_protects_nothing_here() {
+    let (dir, config) = isolated();
+    let tool = tool_folder(dir.path(), "node", &["18.20", "20.11"]);
+    let elsewhere = dir.path().join("tools").join("rust");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+
+    let pins = format!(
+        r#"{{"pins": [{{"folder": "{}", "version": "18.20", "project": "other-tool"}}]}}"#,
+        elsewhere.display()
+    );
+    let path = fake_pmanager(dir.path(), &pins);
+
+    vmanager()
+        .args(["run", "--keep", "1", "--folder"])
+        .arg(&tool)
+        .arg("--config")
+        .arg(&config)
+        .env("PATH", &path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("archived 18.20"))
+        .stdout(predicate::str::contains(
+            "1 archived, 0 skipped, 0 protected",
+        ));
+
+    assert!(!tool.join("18.20").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn pmanager_not_on_path_sweeps_exactly_as_without_it() {
+    let (dir, config) = isolated();
+    let tool = tool_folder(dir.path(), "node", &["18.20", "20.11"]);
+
+    vmanager()
+        .args(["run", "--keep", "1", "--folder"])
+        .arg(&tool)
+        .arg("--config")
+        .arg(&config)
+        .env("PATH", "")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("archived 18.20"))
+        .stdout(predicate::str::contains(
+            "1 archived, 0 skipped, 0 protected",
+        ));
+}
+
 #[test]
 fn schedule_rejects_a_malformed_time() {
     vmanager()

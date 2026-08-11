@@ -225,6 +225,43 @@ One folder failing does not stop the others: an unplugged drive is reported,
 the remaining folders are still swept, and the run ends with a non-zero exit
 code so a failed scheduled run is visible in Task Scheduler's history.
 
+### Versions pManager still wants
+
+`vmanager run` keeps the newest few versions unpacked and asks nothing else
+about a version it does not recognize — until [pManager] is on the same
+machine, in which case it asks one more thing: whether a project has pinned
+itself to one of the versions about to be archived.
+
+```
+$ vmanager run
+C:\Tools\Node  3 version(s), keeping 2
+  keeping 14.21 (pinned by pmanager: legacy-tool)
+  archived 16.20 -> 16.20.7z  ...
+
+1 archived, 0 skipped, 1 protected, 0 failed, ...
+```
+
+`14.21` aged out of the newest two just like `16.20` did, but a project still
+pins itself to it (`pmanager project set-version legacy-tool C:\Tools\Node
+14.21`), so it stays unpacked regardless of how old it gets. Every run asks
+again — `pmanager pins --json`, once per run rather than once per folder —
+so unpinning the project (or archiving *it* out of existence) lets the
+version rejoin the ordinary sweep on the very next run, with nothing to
+undo by hand.
+
+This only ever protects a version that would otherwise be archived; it never
+un-keeps one that the newest-few rule was already keeping. The two tools stay
+separate binaries with separate databases even so — this is a subprocess
+call, `pmanager pins --json`, not a shared file either reads directly, and it
+is the mirror image of the one pManager already makes the other way
+(`vmanager use`, see pManager's own README). The call degrades to nothing
+rather than failing the sweep: pManager not being installed, not being on
+`PATH`, or answering with something this build cannot parse are all just "no
+pins known," the same way `pmanager use` treats a missing vManager. A machine
+that has never heard of pManager sweeps exactly as it always did.
+
+[pManager]: https://github.com/SchmidtiTv/pManager
+
 ### Selecting a version
 
 `vmanager use` points a registered folder's `current` at one of its versions —
@@ -454,6 +491,7 @@ src/
   archive.rs          7z creation: walking, filtering, compression
   link.rs             the `current` junction/symlink `use` points and reads
   shim.rs             discovering shim targets, writing shims, hook patching — filesystem-only
+  pmanager.rs         asking `pmanager pins --json` which versions are pinned
   db.rs               SQLite connection, migrations and queries
   config.rs           config file discovery, parsing and defaults
   error.rs            error type and its exit-code mapping
