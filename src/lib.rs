@@ -13,6 +13,7 @@ pub mod db;
 pub mod error;
 pub mod link;
 pub mod logging;
+pub mod pmanager;
 pub mod shim;
 pub mod sweep;
 pub mod version;

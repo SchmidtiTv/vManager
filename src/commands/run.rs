@@ -5,6 +5,7 @@
 //! at the end and turned into a non-zero exit code, which is what makes a
 //! failed scheduled run visible in Task Scheduler's history.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -12,6 +13,7 @@ use crate::archive::{self, human_bytes};
 use crate::commands::Context;
 use crate::db::{Database, FolderRecord};
 use crate::error::{Error, Result};
+use crate::pmanager::{self, PinnedVersion};
 use crate::shim;
 use crate::sweep::{self, Outcome};
 
@@ -56,6 +58,9 @@ struct Totals {
     archived: u64,
     planned: u64,
     skipped: u64,
+    /// Versions that had aged out of the newest few but were left unpacked
+    /// because pManager still has a project pinned to them.
+    protected: u64,
     failed: u64,
     freed: u64,
 }
@@ -91,6 +96,11 @@ pub fn run(args: &Args, ctx: &Context) -> Result<()> {
 
     let mut totals = Totals::default();
 
+    // Fetched once for the whole run rather than per folder: it is one
+    // subprocess call regardless of how many folders are swept, and pManager
+    // itself never changes mid-run.
+    let pinned = pmanager::pinned_versions();
+
     for target in &targets {
         // `--keep` is a deliberate override for this run; without it the
         // folder's own setting wins, and only then the configured default.
@@ -99,7 +109,7 @@ pub fn run(args: &Args, ctx: &Context) -> Result<()> {
             .or_else(|| target.record.as_ref().and_then(|record| record.keep))
             .unwrap_or(default_keep);
 
-        match sweep_folder(ctx, &db, target, keep, &options, &mut totals) {
+        match sweep_folder(ctx, &db, target, keep, &options, &pinned, &mut totals) {
             Ok(()) => {
                 // Not under `--dry-run`, which must leave the disk exactly
                 // as it found it. Regenerated even when nothing was
@@ -171,15 +181,29 @@ fn targets(args: &Args, db: &Database) -> Result<Vec<Target>> {
         .collect()
 }
 
+/// Narrow every pin pManager reported down to just this folder's, keyed by
+/// version name — the shape [`sweep::Plan::protect`] matches against.
+fn pins_for(pinned: &[PinnedVersion], folder: &std::path::Path) -> HashMap<String, Vec<String>> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for pin in pinned.iter().filter(|pin| pin.folder == folder) {
+        map.entry(pin.version.clone())
+            .or_default()
+            .push(pin.project.clone());
+    }
+    map
+}
+
 fn sweep_folder(
     ctx: &Context,
     db: &Database,
     target: &Target,
     keep: u32,
     options: &sweep::Options,
+    pinned: &[PinnedVersion],
     totals: &mut Totals,
 ) -> Result<()> {
-    let plan = sweep::plan(&target.path, keep)?;
+    let mut plan = sweep::plan(&target.path, keep)?;
+    plan.protect(&pins_for(pinned, &target.path));
     let quiet = ctx.is_quiet();
     let mut out = std::io::stdout().lock();
 
@@ -193,7 +217,21 @@ fn sweep_folder(
         for ignored in &plan.ignored {
             writeln!(out, "  ignoring {} (no version number)", ignored.display())?;
         }
+        for protected in &plan.protected {
+            let projects: Vec<&str> = pinned
+                .iter()
+                .filter(|pin| pin.folder == target.path && pin.version == protected.name)
+                .map(|pin| pin.project.as_str())
+                .collect();
+            writeln!(
+                out,
+                "  keeping {} (pinned by pmanager: {})",
+                protected.name,
+                projects.join(", ")
+            )?;
+        }
     }
+    totals.protected += plan.protected.len() as u64;
 
     if plan.is_empty() {
         if !quiet {
@@ -305,17 +343,18 @@ fn report(ctx: &Context, totals: &Totals, dry_run: bool) -> Result<()> {
     if dry_run {
         writeln!(
             out,
-            "\ndry run: {} version(s) would be archived, {} skipped",
-            totals.planned, totals.skipped
+            "\ndry run: {} version(s) would be archived, {} skipped, {} protected",
+            totals.planned, totals.skipped, totals.protected
         )?;
         return Ok(());
     }
 
     writeln!(
         out,
-        "\n{} archived, {} skipped, {} failed, {} freed",
+        "\n{} archived, {} skipped, {} protected, {} failed, {} freed",
         totals.archived,
         totals.skipped,
+        totals.protected,
         totals.failed,
         human_bytes(totals.freed)
     )?;
