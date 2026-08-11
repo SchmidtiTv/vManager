@@ -71,9 +71,10 @@ pub fn run(args: &Args, ctx: &Context) -> Result<()> {
         writeln!(out, "{} -> {version}", target.display())?;
     }
 
-    // The exe set behind `current` could have changed shape (a version with
-    // a different `bin\` layout, or a tool that dropped/added a binary), so
-    // the shims are regenerated here rather than left to the next `run` —
+    // The target set behind `current` could have changed shape (a version
+    // with a different `bin\` layout, or a tool that dropped/added a
+    // binary), so the shims are regenerated here rather than left to the
+    // next `run` —
     // not because retargeting `current` itself needs it: the junction
     // already makes every existing shim resolve to the new version for free.
     regenerate_shims(ctx, &folder)?;

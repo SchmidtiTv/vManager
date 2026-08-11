@@ -272,17 +272,20 @@ C:\Tools\nodejs\
 
 `shim\` is created empty the moment `vmanager folder add` runs. It is
 populated the first time `vmanager use` or `vmanager run` has something to
-scan — one `<command>.ps1` per `.exe` found under `current` (or, lacking
-that, the newest unpacked version), recursing into subfolders like `bin\`.
-Put `C:\Tools\nodejs\shim` on `PATH` once, and every later `vmanager use
-nodejs <version>` changes what `node`, `npm` and `npx` run without touching
-`PATH` again — nothing here modifies `PATH` for you.
+scan — one `<command>.ps1` per `.exe`, `.ps1`, `.bat`, `.sh` or `.zsh` found
+under `current` (or, lacking that, the newest unpacked version), recursing
+into subfolders like `bin\`. `.exe`, `.ps1` and `.bat` targets are launched
+directly; `.sh` and `.zsh` targets are handed to `bash`/`zsh` respectively,
+which must be on `PATH` at run time (WSL, Git for Windows and Cygwin all
+provide one). Put `C:\Tools\nodejs\shim` on `PATH` once, and every later
+`vmanager use nodejs <version>` changes what `node`, `npm` and `npx` run
+without touching `PATH` again — nothing here modifies `PATH` for you.
 
 That last part is the reason a version switch does not rewrite the shims: a
 `.ps1` resolves its target through `<folder>\current\...` *at run time*, not
 a path baked in for one version, so retargeting the `current` junction is
 enough on its own. Regeneration — rewriting which `.ps1` files exist and
-what is in them — only happens when the *set* of exe names could have
+what is in them — only happens when the *set* of target names could have
 changed: after `vmanager use`, after `vmanager run` (in case the version
 `current` pointed at was itself archived), or on demand:
 
@@ -295,14 +298,15 @@ vmanager shim regenerate                 # manual re-scan/rewrite, for recovery
 Regeneration diffs against what is already there rather than clobbering it:
 a script you dropped into `shim\` by hand, even one whose name collides with
 a discovered command, is left alone — only files vManager itself generated
-(marked as such in their header) are rewritten or removed. Two executables
-under the same active version that would produce the same command name is
-reported as an error naming both paths, rather than silently picking one.
+(marked as such in their header) are rewritten or removed. Two targets
+under the same active version that would produce the same command name
+(e.g. `install.exe` next to `install.ps1`) is reported as an error naming
+both paths, rather than silently picking one.
 
 #### Pre-hooks
 
 A shim can run a script before its command — logging, environment setup,
-whatever — and abort loudly, without launching the real exe, if that script
+whatever — and abort loudly, without launching the real target, if that script
 exits non-zero:
 
 ```sh
@@ -449,7 +453,7 @@ src/
   sweep.rs            the keep-newest-N policy: plan, archive, verify, delete
   archive.rs          7z creation: walking, filtering, compression
   link.rs             the `current` junction/symlink `use` points and reads
-  shim.rs             discovering exes, writing shims, hook patching — filesystem-only
+  shim.rs             discovering shim targets, writing shims, hook patching — filesystem-only
   db.rs               SQLite connection, migrations and queries
   config.rs           config file discovery, parsing and defaults
   error.rs            error type and its exit-code mapping
