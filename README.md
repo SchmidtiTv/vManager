@@ -135,5 +135,5 @@ and add a variant in `src/cli.rs` and a match arm in `src/lib.rs`.
 ## Licenses
 
 All dependencies are permissive (MIT, Apache-2.0, MPL-2.0, Unicode-3.0, Zlib)
-and enforced by `deny.toml`. vManager itself has no license yet
-(`publish = false`).
+and enforced by `deny.toml`. vManager itself is licensed under MIT, see
+[LICENSE](LICENSE).
