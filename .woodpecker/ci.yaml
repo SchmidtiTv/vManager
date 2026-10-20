@@ -1,0 +1,51 @@
+# Formatting, lints and a Windows release build on every push to main and
+# every pull request, plus the dependency checks of .github/workflows/ci.yml.
+#
+# Windows is the only platform vManager targets, so clippy lints the Windows
+# build: it cross-compiles for x86_64-pc-windows-gnu with mingw-w64 (the
+# bundled SQLite is C code, so the target's C compiler is needed even to
+# check). Linting the Linux host build would check the cfg(not(windows))
+# fallbacks instead of the code that ships.
+#
+# The suite is not run here — run it locally with `cargo test`. Clippy still
+# uses `--all-targets`, so the tests are compiled and type-checked; they simply
+# are not executed. A Linux agent cannot run the Windows exe, so instead of a
+# `--version` smoke test the release binaries are built and their DLL imports
+# listed.
+
+when:
+  - event: push
+    branch: main
+  - event: pull_request
+
+# The pinned cargo-deny download is an x86_64 build.
+labels:
+  platform: linux/amd64
+
+variables:
+  - &rust_image docker.io/library/rust:1.97-bookworm
+  - &cargo_deny_version 0.20.2
+
+steps:
+  - name: check
+    image: *rust_image
+    environment:
+      RUSTFLAGS: -D warnings
+      TARGET: x86_64-pc-windows-gnu
+    commands:
+      - apt-get update -qq && apt-get install -y -qq --no-install-recommends gcc-mingw-w64-x86-64 >/dev/null
+      - rustup component add rustfmt clippy
+      - rustup target add "$${TARGET}"
+      - cargo fmt --all --check
+      - cargo clippy --locked --all-targets --all-features --target "$${TARGET}"
+      - cargo build --locked --release --target "$${TARGET}"
+      - x86_64-w64-mingw32-objdump -p "target/$${TARGET}/release/vmanager.exe" "target/$${TARGET}/release/vman.exe" | grep -E 'file format|DLL Name'
+
+  # Reads Cargo metadata only — nothing is compiled.
+  - name: deny
+    image: *rust_image
+    environment:
+      CARGO_DENY_VERSION: *cargo_deny_version
+    commands:
+      - curl -fsSL "https://github.com/EmbarkStudios/cargo-deny/releases/download/$${CARGO_DENY_VERSION}/cargo-deny-$${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz" | tar -xz --strip-components=1 -C /usr/local/bin
+      - cargo deny check licenses advisories bans sources
