@@ -187,12 +187,31 @@ pub fn extract(archive: &Path, dest: &Path) -> Result<u64> {
         .parent()
         .ok_or_else(|| Error::Archive(format!("`{}` has no parent folder", dest.display())))?;
 
-    let expected = sevenz_rust2::Archive::open(archive)
+    let entries = sevenz_rust2::Archive::open(archive)
         .map_err(|err| Error::Archive(format!("`{}` could not be read: {err}", archive.display())))?
-        .files
-        .iter()
-        .filter(|entry| !entry.is_directory)
-        .count() as u64;
+        .files;
+
+    // Extraction happens into the tool folder itself, so an entry outside
+    // `<version>/` would land beside it — over a sibling version or a shim.
+    // Compared component by component, so `<version>/../shim/x` is caught
+    // here and not only by the extractor's own check.
+    let name = dest.file_name().unwrap_or_default();
+    if let Some(stray) = entries.iter().find(|entry| {
+        let entry_name = entry.name().replace('\\', "/");
+        let mut components = Path::new(&entry_name).components();
+        let under_dest =
+            matches!(components.next(), Some(Component::Normal(first)) if first == name);
+        !(under_dest && components.all(|component| matches!(component, Component::Normal(_))))
+    }) {
+        return Err(Error::Archive(format!(
+            "`{}` holds `{}`, outside `{}/`; refusing to unpack it",
+            archive.display(),
+            stray.name(),
+            name.to_string_lossy()
+        )));
+    }
+
+    let expected = entries.iter().filter(|entry| !entry.is_directory).count() as u64;
 
     tracing::info!(archive = %archive.display(), dest = %dest.display(), files = expected, "unpacking archive");
 
@@ -642,6 +661,28 @@ mod tests {
             "world!"
         );
         assert!(dest.is_file(), "the archive is the caller's to delete");
+    }
+
+    #[test]
+    fn extract_refuses_an_archive_with_entries_outside_its_version_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        for (index, stray) in ["1.0/../shim/node.ps1", "shim/node.ps1"].iter().enumerate() {
+            let archive = dir.path().join(format!("evil{index}.vmversion"));
+            let mut writer = ArchiveWriter::create(&archive).unwrap();
+            writer
+                .push_archive_entry(ArchiveEntry::new_file("1.0/tool.exe"), Some(&b"ok"[..]))
+                .unwrap();
+            writer
+                .push_archive_entry(ArchiveEntry::new_file(stray), Some(&b"evil"[..]))
+                .unwrap();
+            writer.finish().unwrap();
+
+            let dest = dir.path().join("1.0");
+            let err = extract(&archive, &dest).unwrap_err();
+            assert!(err.to_string().contains("refusing"), "{stray}: {err}");
+            assert!(!dest.exists(), "{stray}: nothing may be unpacked");
+            assert!(!dir.path().join("shim").exists(), "{stray}");
+        }
     }
 
     #[test]
