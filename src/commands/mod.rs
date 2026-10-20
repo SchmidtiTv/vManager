@@ -8,6 +8,7 @@ pub mod completions;
 pub mod folder;
 pub mod hook;
 pub mod list;
+pub mod pin;
 pub mod run;
 pub mod schedule;
 pub mod shim;

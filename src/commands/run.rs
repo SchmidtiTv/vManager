@@ -5,15 +5,15 @@
 //! at the end and turned into a non-zero exit code, which is what makes a
 //! failed scheduled run visible in Task Scheduler's history.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::archive::{self, human_bytes};
 use crate::commands::Context;
 use crate::db::{Database, FolderRecord};
 use crate::error::{Error, Result};
-use crate::pmanager::{self, PinnedVersion};
+use crate::pinfile;
 use crate::shim;
 use crate::sweep::{self, Outcome};
 
@@ -58,8 +58,8 @@ struct Totals {
     archived: u64,
     planned: u64,
     skipped: u64,
-    /// Versions that had aged out of the newest few but were left unpacked
-    /// because pManager still has a project pinned to them.
+    /// Versions that aged out of the newest few but stay unpacked because a
+    /// `.vmanagerversions` still pins them.
     protected: u64,
     failed: u64,
     freed: u64,
@@ -94,12 +94,12 @@ pub fn run(args: &Args, ctx: &Context) -> Result<()> {
         return Ok(());
     }
 
-    let mut totals = Totals::default();
+    // Read before any folder is touched: a pin file that cannot be parsed
+    // means nobody knows what it protects, so nothing is archived at all.
+    let pinned = pinned_versions(&db, args.dry_run)?;
+    let no_pins = HashMap::new();
 
-    // Fetched once for the whole run rather than per folder: it is one
-    // subprocess call regardless of how many folders are swept, and pManager
-    // itself never changes mid-run.
-    let pinned = pmanager::pinned_versions();
+    let mut totals = Totals::default();
 
     for target in &targets {
         // `--keep` is a deliberate override for this run; without it the
@@ -109,7 +109,11 @@ pub fn run(args: &Args, ctx: &Context) -> Result<()> {
             .or_else(|| target.record.as_ref().and_then(|record| record.keep))
             .unwrap_or(default_keep);
 
-        match sweep_folder(ctx, &db, target, keep, &options, &pinned, &mut totals) {
+        let pins = tool_name(&target.path)
+            .and_then(|name| pinned.get(&name))
+            .unwrap_or(&no_pins);
+
+        match sweep_folder(ctx, &db, target, keep, &options, pins, &mut totals) {
             Ok(()) => {
                 // Not under `--dry-run`, which must leave the disk exactly
                 // as it found it. Regenerated even when nothing was
@@ -181,16 +185,41 @@ fn targets(args: &Args, db: &Database) -> Result<Vec<Target>> {
         .collect()
 }
 
-/// Narrow every pin pManager reported down to just this folder's, keyed by
-/// version name — the shape [`sweep::Plan::protect`] matches against.
-fn pins_for(pinned: &[PinnedVersion], folder: &std::path::Path) -> HashMap<String, Vec<String>> {
-    let mut map: HashMap<String, Vec<String>> = HashMap::new();
-    for pin in pinned.iter().filter(|pin| pin.folder == folder) {
-        map.entry(pin.version.clone())
-            .or_default()
-            .push(pin.project.clone());
+/// Version name to the pin files pinning it, for one tool.
+type ToolPins = HashMap<String, Vec<PathBuf>>;
+
+/// Every version a remembered `.vmanagerversions` pins, keyed by tool name.
+///
+/// A pin file that no longer exists belonged to a project that is gone, so
+/// it is forgotten with a warning (except under `--dry-run`, which changes
+/// nothing). One that exists but cannot be read is an error.
+fn pinned_versions(db: &Database, dry_run: bool) -> Result<HashMap<String, ToolPins>> {
+    let mut pinned: HashMap<String, ToolPins> = HashMap::new();
+    for path in db.pin_files()? {
+        if !path.exists() {
+            tracing::warn!(path = %path.display(), "pin file no longer exists; forgetting it");
+            if !dry_run {
+                db.remove_pin_file(&path)?;
+            }
+            continue;
+        }
+        for (tool, version) in pinfile::read(&path)? {
+            pinned
+                .entry(tool)
+                .or_default()
+                .entry(version)
+                .or_default()
+                .push(path.clone());
+        }
     }
-    map
+    Ok(pinned)
+}
+
+/// The name a pin file uses for the tool in `folder`: the folder's own name.
+pub fn tool_name(folder: &Path) -> Option<String> {
+    folder
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
 }
 
 fn sweep_folder(
@@ -199,11 +228,11 @@ fn sweep_folder(
     target: &Target,
     keep: u32,
     options: &sweep::Options,
-    pinned: &[PinnedVersion],
+    pins: &ToolPins,
     totals: &mut Totals,
 ) -> Result<()> {
-    let mut plan = sweep::plan(&target.path, keep)?;
-    plan.protect(&pins_for(pinned, &target.path));
+    let pinned: HashSet<String> = pins.keys().cloned().collect();
+    let plan = sweep::plan(&target.path, keep)?.protect(&pinned);
     let quiet = ctx.is_quiet();
     let mut out = std::io::stdout().lock();
 
@@ -218,20 +247,42 @@ fn sweep_folder(
             writeln!(out, "  ignoring {} (no version number)", ignored.display())?;
         }
         for protected in &plan.protected {
-            let projects: Vec<&str> = pinned
+            let files: Vec<String> = pins[&protected.name]
                 .iter()
-                .filter(|pin| pin.folder == target.path && pin.version == protected.name)
-                .map(|pin| pin.project.as_str())
+                .map(|file| file.display().to_string())
                 .collect();
             writeln!(
                 out,
-                "  keeping {} (pinned by pmanager: {})",
+                "  keeping {} (pinned by {})",
                 protected.name,
-                projects.join(", ")
+                files.join(", ")
             )?;
         }
     }
     totals.protected += plan.protected.len() as u64;
+
+    // Not under `--dry-run`, which must leave the disk exactly as it found it.
+    if !options.dry_run {
+        for renamed in sweep::rename_legacy_archives(&target.path)? {
+            // A database problem is a warning, as in `record`: the file on
+            // disk already has its new name.
+            if let Err(err) = db.rename_archive(&renamed.from, &renamed.to) {
+                tracing::warn!(error = %err, archive = %renamed.to.display(), "archive renamed but its record could not be updated");
+            }
+            if !quiet {
+                writeln!(
+                    out,
+                    "  renamed {} -> {}",
+                    renamed
+                        .from
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy(),
+                    renamed.to.file_name().unwrap_or_default().to_string_lossy()
+                )?;
+            }
+        }
+    }
 
     if plan.is_empty() {
         if !quiet {

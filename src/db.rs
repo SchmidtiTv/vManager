@@ -70,6 +70,15 @@ const MIGRATIONS: &[&str] = &[
 
     CREATE INDEX hooks_folder_path ON hooks (folder_path);
     "#,
+    // v4 — every `.vmanagerversions` that `vmanager pin` has written, so
+    // `vmanager run` knows which files to read before archiving anything.
+    r#"
+    CREATE TABLE pin_files (
+        id       INTEGER PRIMARY KEY,
+        path     TEXT    NOT NULL UNIQUE,
+        added_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    );
+    "#,
 ];
 
 /// What the `archives` table remembers about one `.7z`.
@@ -197,6 +206,16 @@ impl Database {
         )?;
 
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Point the record of the archive at `from` to its new path `to`, after
+    /// the file itself was renamed. An archive with no record is fine.
+    pub fn rename_archive(&self, from: &Path, to: &Path) -> Result<()> {
+        self.conn.execute(
+            "UPDATE archives SET archive_path = ?2 WHERE archive_path = ?1",
+            params![from.to_string_lossy(), to.to_string_lossy()],
+        )?;
+        Ok(())
     }
 
     /// What is known about the archive at `path`, if anything.
@@ -335,6 +354,34 @@ impl Database {
                FROM hooks WHERE folder_path = ?1 ORDER BY command",
         )?;
         let rows = statement.query_map([folder.to_string_lossy()], row_to_hook)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Remember a pin file so `vmanager run` protects what it pins. Adding
+    /// one that is already known is a no-op.
+    pub fn add_pin_file(&self, path: &Path) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO pin_files (path) VALUES (?1) ON CONFLICT (path) DO NOTHING",
+            [path.to_string_lossy()],
+        )?;
+        Ok(())
+    }
+
+    /// Forget a pin file, e.g. once its project directory is gone.
+    pub fn remove_pin_file(&self, path: &Path) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM pin_files WHERE path = ?1",
+            [path.to_string_lossy()],
+        )?;
+        Ok(())
+    }
+
+    /// Every remembered pin file, ordered by path.
+    pub fn pin_files(&self) -> Result<Vec<PathBuf>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT path FROM pin_files ORDER BY path")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0).map(PathBuf::from))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -706,6 +753,32 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn pin_files_are_remembered_once_and_can_be_forgotten() {
+        let db = Database::open_in_memory().unwrap();
+        db.add_pin_file(Path::new("/proj/b/.vmanagerversions"))
+            .unwrap();
+        db.add_pin_file(Path::new("/proj/a/.vmanagerversions"))
+            .unwrap();
+        db.add_pin_file(Path::new("/proj/a/.vmanagerversions"))
+            .unwrap();
+
+        assert_eq!(
+            db.pin_files().unwrap(),
+            [
+                PathBuf::from("/proj/a/.vmanagerversions"),
+                PathBuf::from("/proj/b/.vmanagerversions")
+            ]
+        );
+
+        db.remove_pin_file(Path::new("/proj/a/.vmanagerversions"))
+            .unwrap();
+        assert_eq!(
+            db.pin_files().unwrap(),
+            [PathBuf::from("/proj/b/.vmanagerversions")]
         );
     }
 }

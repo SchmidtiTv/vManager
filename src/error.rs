@@ -75,6 +75,11 @@ pub enum Error {
     #[error("{0}")]
     Shim(String),
 
+    /// A `.vmanagerversions` pin file could not be read, parsed or written,
+    /// or a pin could not be applied.
+    #[error("{0}")]
+    Pin(String),
+
     /// The user interrupted the run.
     #[error("interrupted")]
     Interrupted,
@@ -98,7 +103,7 @@ impl Error {
             Error::Database(_) | Error::Sqlite(_) => exit::DATABASE,
             Error::Archive(_) => exit::ARCHIVE,
             Error::Interrupted => exit::INTERRUPTED,
-            Error::Io(_) | Error::Other(_) | Error::Shim(_) => exit::FAILURE,
+            Error::Io(_) | Error::Other(_) | Error::Shim(_) | Error::Pin(_) => exit::FAILURE,
         }
     }
 

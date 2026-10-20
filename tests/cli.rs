@@ -27,6 +27,16 @@ fn prints_version() {
 }
 
 #[test]
+fn vman_is_the_same_program_under_a_shorter_name() {
+    Command::cargo_bin("vman")
+        .expect("binary is built")
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
 fn prints_help_with_exit_code_zero() {
     vmanager()
         .arg("--help")
@@ -241,8 +251,8 @@ fn registering_a_folder_and_sweeping_it_archives_the_oldest_versions() {
 
     // The two oldest are now archives; the two newest are untouched. Note that
     // 4.10 is kept and 4.2 is not: the ordering is numeric, not alphabetic.
-    assert!(tool.join("4.1.7z").is_file());
-    assert!(tool.join("4.2.7z").is_file());
+    assert!(tool.join("4.1.vmversion").is_file());
+    assert!(tool.join("4.2.vmversion").is_file());
     assert!(!tool.join("4.1").exists());
     assert!(!tool.join("4.2").exists());
     assert!(tool.join("4.3").is_dir());
@@ -278,7 +288,7 @@ fn a_second_sweep_has_nothing_left_to_do() {
         .success()
         .stdout(predicate::str::contains("1 archived"));
 
-    // The .7z left behind must not be mistaken for a version folder, so the
+    // The .vmversion left behind must not be mistaken for a version folder, so the
     // daily run settles instead of eating a version every day.
     vmanager()
         .args(["run", "--config"])
@@ -314,7 +324,10 @@ fn a_dry_run_reports_without_touching_anything() {
         .stdout(predicate::str::contains("dry run"));
 
     assert!(tool.join("1.0").is_dir(), "a dry run must not delete");
-    assert!(!tool.join("1.0.7z").exists(), "a dry run must not write");
+    assert!(
+        !tool.join("1.0.vmversion").exists(),
+        "a dry run must not write"
+    );
 }
 
 #[test]
@@ -331,7 +344,7 @@ fn keep_source_writes_the_archive_but_leaves_the_folder() {
         .success()
         .stdout(predicate::str::contains("folder kept"));
 
-    assert!(tool.join("1.0.7z").is_file());
+    assert!(tool.join("1.0.vmversion").is_file());
     assert!(tool.join("1.0").is_dir());
 }
 
@@ -425,7 +438,7 @@ fn folders_without_version_numbers_are_left_alone() {
         .stdout(predicate::str::contains("1 archived"));
 
     assert!(tool.join("current").is_dir(), "`current` is not a version");
-    assert!(!tool.join("current.7z").exists());
+    assert!(!tool.join("current.vmversion").exists());
 }
 
 #[test]
@@ -560,14 +573,14 @@ fn one_broken_folder_does_not_stop_the_others() {
         .stdout(predicate::str::contains("1 archived"))
         .stderr(predicate::str::contains("not found"));
 
-    assert!(healthy.join("1.0.7z").is_file());
+    assert!(healthy.join("1.0.vmversion").is_file());
 }
 
 #[test]
 fn an_existing_archive_is_skipped_until_forced() {
     let (dir, config) = isolated();
     let tool = tool_folder(dir.path(), "blender", &["1.0", "2.0", "3.0"]);
-    std::fs::write(tool.join("1.0.7z"), b"left over from something else").unwrap();
+    std::fs::write(tool.join("1.0.vmversion"), b"left over from something else").unwrap();
 
     let sweep = || {
         let mut cmd = vmanager();
@@ -616,7 +629,7 @@ fn sweeping_an_unregistered_folder_works_without_registering_it() {
         .stdout(predicate::str::contains("no folders registered yet"));
 
     // …but the archive is still on disk and the folder still gone.
-    assert!(tool.join("1.0.7z").is_file());
+    assert!(tool.join("1.0.vmversion").is_file());
     assert!(!tool.join("1.0").exists());
 }
 
@@ -636,126 +649,11 @@ fn the_archive_of_a_swept_version_restores_it() {
     // The whole point of archiving rather than deleting: the old version can
     // come back, folder name and contents intact.
     let restored = dir.path().join("restored");
-    sevenz_rust2::decompress_file(tool.join("1.0.7z"), &restored).unwrap();
+    sevenz_rust2::decompress_file(tool.join("1.0.vmversion"), &restored).unwrap();
     assert_eq!(
         std::fs::read_to_string(restored.join("1.0").join("tool.exe")).unwrap(),
         "blender 1.0"
     );
-}
-
-// --- coordinating with pManager ----------------------------------------------
-
-/// Puts a fake `pmanager` on `PATH` that answers `pmanager pins --json` with
-/// `pins_json` regardless of what it is actually called with — enough to
-/// drive `vmanager run`'s side of the integration without a real pManager
-/// installed. Returns the `PATH` to hand to the child process.
-#[cfg(unix)]
-fn fake_pmanager(dir: &std::path::Path, pins_json: &str) -> std::ffi::OsString {
-    use std::io::Write as _;
-    use std::os::unix::fs::PermissionsExt;
-
-    let bin = dir.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    let script = bin.join("pmanager");
-    {
-        let mut file = std::fs::File::create(&script).unwrap();
-        writeln!(file, "#!/bin/sh\ncat <<'PINS'\n{pins_json}\nPINS").unwrap();
-    }
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-    let mut path = std::ffi::OsString::from(bin.as_os_str());
-    path.push(":");
-    path.push(std::env::var_os("PATH").unwrap_or_default());
-    path
-}
-
-#[cfg(unix)]
-#[test]
-fn a_version_pinned_by_pmanager_is_kept_even_after_it_ages_out() {
-    let (dir, config) = isolated();
-    let tool = tool_folder(dir.path(), "node", &["18.20", "20.11", "22.16"]);
-    // The database stores canonicalized paths; the pin must be spelled the
-    // same way for the two to line up.
-    let tool = tool.canonicalize().unwrap();
-
-    let pins = format!(
-        r#"{{"pins": [{{"folder": "{}", "version": "18.20", "project": "legacy-tool"}}]}}"#,
-        tool.display()
-    );
-    let path = fake_pmanager(dir.path(), &pins);
-
-    vmanager()
-        .args(["run", "--keep", "1", "--folder"])
-        .arg(&tool)
-        .arg("--config")
-        .arg(&config)
-        .env("PATH", &path)
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "keeping 18.20 (pinned by pmanager: legacy-tool)",
-        ))
-        .stdout(predicate::str::contains("archived 20.11"))
-        .stdout(predicate::str::contains(
-            "1 archived, 0 skipped, 1 protected",
-        ));
-
-    assert!(
-        tool.join("18.20").is_dir(),
-        "the pinned version must survive the sweep"
-    );
-    assert!(!tool.join("20.11").exists());
-    assert!(tool.join("22.16").is_dir(), "the newest is kept regardless");
-}
-
-#[cfg(unix)]
-#[test]
-fn a_pin_for_a_different_folder_protects_nothing_here() {
-    let (dir, config) = isolated();
-    let tool = tool_folder(dir.path(), "node", &["18.20", "20.11"]);
-    let elsewhere = dir.path().join("tools").join("rust");
-    std::fs::create_dir_all(&elsewhere).unwrap();
-
-    let pins = format!(
-        r#"{{"pins": [{{"folder": "{}", "version": "18.20", "project": "other-tool"}}]}}"#,
-        elsewhere.display()
-    );
-    let path = fake_pmanager(dir.path(), &pins);
-
-    vmanager()
-        .args(["run", "--keep", "1", "--folder"])
-        .arg(&tool)
-        .arg("--config")
-        .arg(&config)
-        .env("PATH", &path)
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("archived 18.20"))
-        .stdout(predicate::str::contains(
-            "1 archived, 0 skipped, 0 protected",
-        ));
-
-    assert!(!tool.join("18.20").exists());
-}
-
-#[cfg(unix)]
-#[test]
-fn pmanager_not_on_path_sweeps_exactly_as_without_it() {
-    let (dir, config) = isolated();
-    let tool = tool_folder(dir.path(), "node", &["18.20", "20.11"]);
-
-    vmanager()
-        .args(["run", "--keep", "1", "--folder"])
-        .arg(&tool)
-        .arg("--config")
-        .arg(&config)
-        .env("PATH", "")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("archived 18.20"))
-        .stdout(predicate::str::contains(
-            "1 archived, 0 skipped, 0 protected",
-        ));
 }
 
 #[test]
@@ -822,7 +720,7 @@ fn list_shows_archived_and_unpacked_versions_oldest_first() {
     );
     assert!(rendered.contains("archived"), "{rendered}");
     assert!(rendered.contains("unpacked"), "{rendered}");
-    // The original size comes from the database, not from the .7z.
+    // The original size comes from the database, not from the .vmversion.
     assert!(rendered.contains("in 1 file(s)"), "{rendered}");
 }
 
@@ -879,7 +777,7 @@ fn list_reports_an_archive_the_database_has_never_seen() {
     let tool = tool_folder(dir.path(), "blender", &["2.0"]);
     // An archive from an older machine, or one whose database was deleted:
     // the file exists, so it should be listed even without a record.
-    std::fs::write(tool.join("1.0.7z"), b"pretend archive").unwrap();
+    std::fs::write(tool.join("1.0.vmversion"), b"pretend archive").unwrap();
 
     vmanager()
         .args(["list", "--folder"])
@@ -1604,4 +1502,316 @@ fn run_recovers_the_shim_after_the_active_version_gets_archived() {
     // is rewritten to match without anyone running `use` again first.
     let after = std::fs::read_to_string(tool.join("shim").join("tool.ps1")).unwrap();
     assert!(after.contains("current\\bin\\tool.exe"), "{after}");
+}
+
+// --- pinning versions per directory ----------------------------------------
+
+/// A registered tool folder plus an empty project directory to pin from.
+fn pinned_setup(
+    versions: &[&str],
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let (dir, config) = isolated();
+    let tool = tool_folder(dir.path(), "node", versions);
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    vmanager()
+        .args(["folder", "add"])
+        .arg(&tool)
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success();
+
+    (dir, config, tool, project)
+}
+
+#[test]
+fn a_pinned_version_is_written_to_the_directory_and_survives_the_sweep() {
+    let (_dir, config, tool, project) = pinned_setup(&["1.0", "2.0", "3.0"]);
+
+    vmanager()
+        .current_dir(&project)
+        .args(["pin", "node", "1.0", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("pinned node -> 1.0"));
+
+    let content = std::fs::read_to_string(project.join(".vmanagerversions")).unwrap();
+    assert!(content.contains("\"node\" = \"1.0\""), "{content}");
+
+    vmanager()
+        .args(["run", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("keeping 1.0 (pinned by"))
+        .stdout(predicate::str::contains(
+            "0 archived, 0 skipped, 1 protected",
+        ));
+    assert!(tool.join("1.0").is_dir());
+
+    vmanager()
+        .current_dir(&project)
+        .args(["pin", "node", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("node -> 1.0"));
+}
+
+#[test]
+fn pinning_an_archived_version_unpacks_it() {
+    let (_dir, config, tool, project) = pinned_setup(&["1.0", "2.0", "3.0"]);
+
+    vmanager()
+        .args(["run", "--config"])
+        .arg(&config)
+        .assert()
+        .success();
+    assert!(tool.join("1.0.vmversion").is_file());
+
+    vmanager()
+        .current_dir(&project)
+        .args(["pin", "node", "1.0", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unpacked node 1.0"));
+
+    assert_eq!(
+        std::fs::read_to_string(tool.join("1.0").join("tool.exe")).unwrap(),
+        "node 1.0"
+    );
+    assert!(!tool.join("1.0.vmversion").exists());
+}
+
+#[test]
+fn a_cleared_or_deleted_pin_no_longer_protects_its_version() {
+    let (_dir, config, tool, project) = pinned_setup(&["1.0", "2.0", "3.0"]);
+
+    vmanager()
+        .current_dir(&project)
+        .args(["pin", "node", "1.0", "--config"])
+        .arg(&config)
+        .assert()
+        .success();
+    vmanager()
+        .current_dir(&project)
+        .args(["pin", "node", "--clear", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unpinned node"));
+
+    vmanager()
+        .current_dir(&project)
+        .args(["pin", "node", "--clear", "--config"])
+        .arg(&config)
+        .assert()
+        .code(4);
+
+    vmanager()
+        .current_dir(&project)
+        .args(["pin", "node", "1.0", "--config"])
+        .arg(&config)
+        .assert()
+        .success();
+    std::fs::remove_file(project.join(".vmanagerversions")).unwrap();
+
+    vmanager()
+        .args(["run", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("pin file no longer exists"))
+        .stdout(predicate::str::contains("archived 1.0"));
+    assert!(tool.join("1.0.vmversion").is_file());
+}
+
+#[test]
+fn pinning_an_unknown_version_or_tool_is_not_found() {
+    let (_dir, config, _tool, project) = pinned_setup(&["1.0"]);
+
+    vmanager()
+        .current_dir(&project)
+        .args(["pin", "node", "9.9", "--config"])
+        .arg(&config)
+        .assert()
+        .code(4);
+    vmanager()
+        .current_dir(&project)
+        .args(["pin", "python", "3.12", "--config"])
+        .arg(&config)
+        .assert()
+        .code(4);
+    assert!(!project.join(".vmanagerversions").exists());
+}
+
+#[test]
+fn an_unparseable_pin_file_stops_the_sweep_before_anything_is_archived() {
+    let (_dir, config, tool, project) = pinned_setup(&["1.0", "2.0", "3.0"]);
+
+    vmanager()
+        .current_dir(&project)
+        .args(["pin", "node", "2.0", "--config"])
+        .arg(&config)
+        .assert()
+        .success();
+    std::fs::write(project.join(".vmanagerversions"), "node = 1\n").unwrap();
+
+    vmanager()
+        .args(["run", "--config"])
+        .arg(&config)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("not a valid pin file"));
+    assert!(tool.join("1.0").is_dir());
+}
+
+#[test]
+fn the_pin_menu_refuses_to_open_without_a_terminal() {
+    let (_dir, config, _tool, project) = pinned_setup(&["1.0"]);
+
+    vmanager()
+        .current_dir(&project)
+        .args(["pin", "--config"])
+        .arg(&config)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("interactive terminal"));
+}
+
+#[cfg(windows)]
+#[test]
+fn a_shim_launches_the_version_pinned_for_its_working_directory() {
+    let (dir, config, tool, project) = pinned_setup(&["1.0", "2.0"]);
+    for version in ["1.0", "2.0"] {
+        // A `.bat` that says which version ran, in place of the dummy exe.
+        std::fs::remove_file(tool.join(version).join("tool.exe")).unwrap();
+        std::fs::write(
+            tool.join(version).join("tool.bat"),
+            format!("@echo node {version}\r\n"),
+        )
+        .unwrap();
+    }
+
+    vmanager()
+        .arg("use")
+        .arg(&tool)
+        .arg("2.0")
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success();
+    vmanager()
+        .current_dir(&project)
+        .args(["pin", "node", "1.0", "--config"])
+        .arg(&config)
+        .assert()
+        .success();
+
+    let shim = tool.join("shim").join("tool.ps1");
+    let launch = |cwd: &std::path::Path| {
+        let output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&shim)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    // A subdirectory finds the pin file above it.
+    let nested = project.join("src");
+    std::fs::create_dir_all(&nested).unwrap();
+    assert!(launch(&nested).contains("node 1.0"));
+    // Outside the project, `current` applies.
+    assert!(launch(dir.path()).contains("node 2.0"));
+
+    // The `.cmd` launcher, for callers that cannot run a `.ps1`, behaves the same.
+    let launcher = tool.join("shim").join("tool.cmd");
+    let via_cmd = |cwd: &std::path::Path| {
+        let output = std::process::Command::new(&launcher)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    assert!(via_cmd(&nested).contains("node 1.0"));
+    assert!(via_cmd(dir.path()).contains("node 2.0"));
+
+    // Hand-written pins in any shape TOML accepts are honoured…
+    let edited = dir.path().join("edited");
+    std::fs::create_dir_all(&edited).unwrap();
+    std::fs::write(
+        edited.join(".vmanagerversions"),
+        "node = '1.0'  # legacy build\n",
+    )
+    .unwrap();
+    assert!(launch(&edited).contains("node 1.0"));
+
+    // …and one the shim cannot read aborts instead of running `current`.
+    std::fs::write(edited.join(".vmanagerversions"), "node = 1.0\n").unwrap();
+    let output = launch(&edited);
+    assert!(!output.contains("node 2.0"), "{output}");
+
+    // A pin pointing out of the tool folder never runs what it points at.
+    let outside = dir.path().join("evil");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("tool.bat"), "@echo escaped\r\n").unwrap();
+    std::fs::write(edited.join(".vmanagerversions"), "node = \"..\\\\evil\"\n").unwrap();
+    let output = launch(&edited);
+    assert!(!output.contains("escaped"), "{output}");
+}
+
+#[test]
+fn archives_from_before_the_vmversion_extension_are_renamed_by_run() {
+    let (dir, config) = isolated();
+    let tool = tool_folder(dir.path(), "blender", &["4.1", "4.2", "4.3"]);
+    vmanager()
+        .args(["folder", "add"])
+        .arg(&tool)
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success();
+    vmanager()
+        .args(["run", "--config"])
+        .arg(&config)
+        .assert()
+        .success();
+
+    // What an older vmanager would have left behind.
+    std::fs::rename(tool.join("4.1.vmversion"), tool.join("4.1.7z")).unwrap();
+
+    vmanager()
+        .args(["run", "--dry-run", "--config"])
+        .arg(&config)
+        .assert()
+        .success();
+    assert!(tool.join("4.1.7z").is_file(), "a dry run must not rename");
+
+    vmanager()
+        .args(["run", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("renamed 4.1.7z -> 4.1.vmversion"));
+    assert!(tool.join("4.1.vmversion").is_file());
+
+    // The database record followed the file, so the original size is known.
+    vmanager()
+        .args(["list", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("from"))
+        .stdout(predicate::str::contains("not in the database").not());
 }

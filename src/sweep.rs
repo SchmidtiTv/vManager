@@ -6,7 +6,7 @@
 //!
 //! 1. list the version folders under it, oldest first ([`crate::version`]),
 //! 2. set aside the newest `keep` of them,
-//! 3. for every older one: write `<version>.7z` next to it, confirm the
+//! 3. for every older one: write `<version>.vmversion` next to it, confirm the
 //!    archive really contains what was walked, and only then delete the
 //!    folder.
 //!
@@ -14,7 +14,7 @@
 //! after the archive is on disk and has been read back. A failure anywhere
 //! before that leaves the version folder untouched.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::archive::{self, Summary};
@@ -24,7 +24,7 @@ use crate::version::{self, OrderKey, VersionFolder};
 /// How a sweep should behave.
 #[derive(Debug, Clone, Default)]
 pub struct Options {
-    /// How the `.7z` files are written.
+    /// How the `.vmversion` files are written.
     pub archive: archive::Options,
     /// Work out what would happen and report it, changing nothing on disk.
     pub dry_run: bool,
@@ -50,10 +50,9 @@ pub struct Plan {
     pub victims: Vec<VersionFolder>,
     /// Child folders that are not versions and will not be touched.
     pub ignored: Vec<PathBuf>,
-    /// Versions that would otherwise be in [`Self::victims`], but a project
-    /// pManager tracks is still pinned to them. Always empty until
-    /// [`Self::protect`] is called — `plan` itself knows nothing about
-    /// pManager, only the filesystem.
+    /// Versions that would otherwise be in [`Self::victims`], but a
+    /// `.vmanagerversions` still pins them. Always empty until
+    /// [`Self::protect`] is called — `plan` itself only knows the filesystem.
     pub protected: Vec<VersionFolder>,
 }
 
@@ -68,28 +67,19 @@ impl Plan {
         self.victims.is_empty()
     }
 
-    /// Move any victim named in `pinned` out of [`Self::victims`] and into
-    /// [`Self::protected`], so a version that has aged out of the newest few
-    /// is still not archived while pManager still has a project pinned to
-    /// it.
-    ///
-    /// `pinned` maps a version *name* — matched exactly, the same string
-    /// `vmanager use` would take as `<VERSION>` — to the project name(s)
-    /// pinning it, kept only so the caller can explain the skip. Matching is
-    /// by name alone: the caller has already narrowed `pinned` down to pins
-    /// for this plan's own folder (see `commands::run::sweep_folder`), so
-    /// nothing here needs to know a folder path at all.
-    pub fn protect(&mut self, pinned: &HashMap<String, Vec<String>>) {
-        if pinned.is_empty() {
-            return;
-        }
-
-        let candidates = std::mem::take(&mut self.victims);
-        let (protected, victims) = candidates
+    /// A copy of this plan with every victim named in `pinned` moved into
+    /// [`Self::protected`]. Names match exactly, the same string a pin file
+    /// stores; a pinned version the newest-few rule already keeps stays kept.
+    pub fn protect(self, pinned: &HashSet<String>) -> Plan {
+        let (protected, victims) = self
+            .victims
             .into_iter()
-            .partition(|victim| pinned.contains_key(&victim.name));
-        self.protected = protected;
-        self.victims = victims;
+            .partition(|victim| pinned.contains(&victim.name));
+        Plan {
+            victims,
+            protected,
+            ..self
+        }
     }
 }
 
@@ -139,10 +129,46 @@ pub fn plan(root: &Path, keep: u32) -> Result<Plan> {
     })
 }
 
-/// Where the archive for a version folder goes: `<version>.7z` alongside it,
-/// inside the registered folder.
+/// Where the archive for a version folder goes: `<version>.vmversion`
+/// alongside it, inside the registered folder.
 pub fn destination(root: &Path, victim: &VersionFolder) -> PathBuf {
     root.join(format!("{}.{}", victim.name, archive::EXTENSION))
+}
+
+/// One archive [`rename_legacy_archives`] moved to the current extension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Renamed {
+    pub from: PathBuf,
+    pub to: PathBuf,
+}
+
+/// Rename every `<name>.7z` directly in `root` — archives written before
+/// [`archive::EXTENSION`] existed — to `<name>.vmversion`. Fails, renaming
+/// nothing further, when the new name is already taken.
+pub fn rename_legacy_archives(root: &Path) -> Result<Vec<Renamed>> {
+    let mut renamed = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let from = entry.path();
+        if !entry.file_type()?.is_file()
+            || from.extension().and_then(|ext| ext.to_str()) != Some(archive::LEGACY_EXTENSION)
+        {
+            continue;
+        }
+
+        let to = from.with_extension(archive::EXTENSION);
+        if to.exists() {
+            return Err(Error::Archive(format!(
+                "cannot rename `{}` to `{}`: that file already exists",
+                from.display(),
+                to.display()
+            )));
+        }
+        std::fs::rename(&from, &to)?;
+        renamed.push(Renamed { from, to });
+    }
+    renamed.sort_by(|a, b| a.from.cmp(&b.from));
+    Ok(renamed)
 }
 
 /// Archive one version folder and, unless told otherwise, delete it.
@@ -190,6 +216,25 @@ pub fn sweep_one(root: &Path, victim: &VersionFolder, options: &Options) -> Resu
         summary,
         deleted: true,
     })
+}
+
+/// Unpack the archived version `name` back into `<root>\<name>` and, once
+/// the unpacked file count is confirmed, delete the `.vmversion` — the reverse of
+/// [`sweep_one`], with the delete again last. Returns the files unpacked.
+pub fn restore(root: &Path, name: &str) -> Result<u64> {
+    let archive = root.join(format!("{name}.{}", archive::EXTENSION));
+    let folder = root.join(name);
+    let files = archive::extract(&archive, &folder)?;
+
+    tracing::info!(path = %archive.display(), "removing unpacked archive");
+    std::fs::remove_file(&archive).map_err(|err| {
+        Error::Archive(format!(
+            "unpacked `{}` to `{}` but could not remove the archive: {err}",
+            archive.display(),
+            folder.display()
+        ))
+    })?;
+    Ok(files)
 }
 
 /// Read the finished archive back and confirm it holds what was walked.
@@ -272,55 +317,6 @@ mod tests {
     }
 
     #[test]
-    fn protecting_a_pinned_version_moves_it_out_of_the_victims() {
-        let dir = tools(&["1.0", "2.0", "3.0", "4.0"]);
-        let mut plan = plan(dir.path(), 2).unwrap();
-        assert_eq!(victim_names(&plan), ["1.0", "2.0"]);
-
-        let mut pinned = HashMap::new();
-        pinned.insert("1.0".to_string(), vec!["legacy-tool".to_string()]);
-        plan.protect(&pinned);
-
-        assert_eq!(victim_names(&plan), ["2.0"]);
-        assert_eq!(
-            plan.protected
-                .iter()
-                .map(|entry| entry.name.as_str())
-                .collect::<Vec<_>>(),
-            ["1.0"]
-        );
-        // Still counted, just no longer a victim.
-        assert_eq!(plan.version_count(), 4);
-    }
-
-    #[test]
-    fn protecting_with_nothing_pinned_changes_nothing() {
-        let dir = tools(&["1.0", "2.0", "3.0"]);
-        let mut plan = plan(dir.path(), 2).unwrap();
-        let before: Vec<String> = victim_names(&plan).into_iter().map(String::from).collect();
-
-        plan.protect(&HashMap::new());
-
-        assert_eq!(victim_names(&plan), before);
-        assert!(plan.protected.is_empty());
-    }
-
-    #[test]
-    fn protecting_a_version_that_is_already_kept_does_nothing() {
-        // Pinned to the newest version, which was never going to be archived
-        // anyway — protect() only ever moves things out of victims.
-        let dir = tools(&["1.0", "2.0", "3.0"]);
-        let mut plan = plan(dir.path(), 2).unwrap();
-
-        let mut pinned = HashMap::new();
-        pinned.insert("3.0".to_string(), vec!["api-server".to_string()]);
-        plan.protect(&pinned);
-
-        assert_eq!(victim_names(&plan), ["1.0"]);
-        assert!(plan.protected.is_empty());
-    }
-
-    #[test]
     fn a_keep_of_zero_still_keeps_one() {
         // Sweeping every version away would leave the tool unusable, so the
         // floor is one — the config and the CLI both refuse 0 as well.
@@ -343,7 +339,7 @@ mod tests {
         assert!(deleted);
         assert_eq!(summary.file_count, 1);
 
-        let dest = dir.path().join("1.0.7z");
+        let dest = dir.path().join("1.0.vmversion");
         assert!(dest.is_file(), "the archive should be next to the versions");
         assert!(
             !dir.path().join("1.0").exists(),
@@ -360,11 +356,78 @@ mod tests {
         sweep_one(dir.path(), &plan.victims[0], &Options::default()).unwrap();
 
         let out = dir.path().join("restored");
-        sevenz_rust2::decompress_file(dir.path().join("1.0.7z"), &out).unwrap();
+        sevenz_rust2::decompress_file(dir.path().join("1.0.vmversion"), &out).unwrap();
         assert_eq!(
             std::fs::read_to_string(out.join("1.0").join("tool.exe")).unwrap(),
             "build 1.0"
         );
+    }
+
+    #[test]
+    fn restore_unpacks_the_version_and_removes_its_archive() {
+        let dir = tools(&["1.0", "2.0", "3.0"]);
+        let plan = plan(dir.path(), 2).unwrap();
+        sweep_one(dir.path(), &plan.victims[0], &Options::default()).unwrap();
+
+        assert_eq!(restore(dir.path(), "1.0").unwrap(), 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("1.0").join("tool.exe")).unwrap(),
+            "build 1.0"
+        );
+        assert!(!dir.path().join("1.0.vmversion").exists());
+    }
+
+    #[test]
+    fn legacy_7z_archives_are_renamed_to_the_current_extension() {
+        let dir = tools(&["3.0"]);
+        std::fs::write(dir.path().join("1.0.7z"), b"old").unwrap();
+        std::fs::write(dir.path().join("2.0.vmversion"), b"new").unwrap();
+
+        let renamed = rename_legacy_archives(dir.path()).unwrap();
+
+        assert_eq!(
+            renamed,
+            [Renamed {
+                from: dir.path().join("1.0.7z"),
+                to: dir.path().join("1.0.vmversion"),
+            }]
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("1.0.vmversion")).unwrap(),
+            b"old"
+        );
+        assert!(rename_legacy_archives(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_legacy_archive_whose_new_name_is_taken_is_an_error() {
+        let dir = tools(&["3.0"]);
+        std::fs::write(dir.path().join("1.0.7z"), b"old").unwrap();
+        std::fs::write(dir.path().join("1.0.vmversion"), b"new").unwrap();
+
+        assert!(rename_legacy_archives(dir.path()).is_err());
+        assert!(dir.path().join("1.0.7z").is_file());
+    }
+
+    #[test]
+    fn protecting_a_pinned_version_moves_it_out_of_the_victims() {
+        let dir = tools(&["1.0", "2.0", "3.0", "4.0"]);
+        let pinned = HashSet::from(["1.0".to_string()]);
+        let plan = plan(dir.path(), 2).unwrap().protect(&pinned);
+
+        assert_eq!(victim_names(&plan), ["2.0"]);
+        assert_eq!(plan.protected[0].name, "1.0");
+        assert_eq!(plan.version_count(), 4);
+    }
+
+    #[test]
+    fn protecting_a_version_that_is_already_kept_changes_nothing() {
+        let dir = tools(&["1.0", "2.0", "3.0"]);
+        let pinned = HashSet::from(["3.0".to_string()]);
+        let plan = plan(dir.path(), 2).unwrap().protect(&pinned);
+
+        assert_eq!(victim_names(&plan), ["1.0"]);
+        assert!(plan.protected.is_empty());
     }
 
     #[test]
@@ -379,7 +442,7 @@ mod tests {
         let outcome = sweep_one(dir.path(), &plan.victims[0], &options).unwrap();
 
         assert!(matches!(outcome, Outcome::Archived { deleted: false, .. }));
-        assert!(dir.path().join("1.0.7z").is_file());
+        assert!(dir.path().join("1.0.vmversion").is_file());
         assert!(dir.path().join("1.0").is_dir(), "nothing should be deleted");
     }
 
@@ -396,7 +459,7 @@ mod tests {
 
         assert!(matches!(outcome, Outcome::Planned));
         assert_eq!(outcome.freed_bytes(), 0);
-        assert!(!dir.path().join("1.0.7z").exists());
+        assert!(!dir.path().join("1.0.vmversion").exists());
         assert!(dir.path().join("1.0").is_dir());
     }
 
@@ -433,7 +496,7 @@ mod tests {
     fn an_existing_archive_is_skipped_not_overwritten() {
         let dir = tools(&["1.0", "2.0", "3.0"]);
         let plan = plan(dir.path(), 2).unwrap();
-        std::fs::write(dir.path().join("1.0.7z"), b"not really an archive").unwrap();
+        std::fs::write(dir.path().join("1.0.vmversion"), b"not really an archive").unwrap();
 
         let outcome = sweep_one(dir.path(), &plan.victims[0], &Options::default()).unwrap();
 
@@ -444,7 +507,7 @@ mod tests {
         // The point of skipping: neither the stale archive nor the folder is
         // destroyed while the two disagree.
         assert_eq!(
-            std::fs::read(dir.path().join("1.0.7z")).unwrap(),
+            std::fs::read(dir.path().join("1.0.vmversion")).unwrap(),
             b"not really an archive"
         );
         assert!(dir.path().join("1.0").is_dir());
@@ -454,7 +517,7 @@ mod tests {
     fn force_replaces_an_existing_archive() {
         let dir = tools(&["1.0", "2.0", "3.0"]);
         let plan = plan(dir.path(), 2).unwrap();
-        std::fs::write(dir.path().join("1.0.7z"), b"stale").unwrap();
+        std::fs::write(dir.path().join("1.0.vmversion"), b"stale").unwrap();
 
         let options = Options {
             archive: archive::Options {
@@ -487,7 +550,7 @@ mod tests {
     fn verification_rejects_a_mismatched_archive() {
         let dir = tools(&["1.0", "2.0", "3.0"]);
         let plan = plan(dir.path(), 2).unwrap();
-        let dest = dir.path().join("1.0.7z");
+        let dest = dir.path().join("1.0.vmversion");
 
         let mut summary =
             archive::create(&plan.victims[0].path, &dest, &archive::Options::default()).unwrap();
@@ -503,7 +566,7 @@ mod tests {
     #[test]
     fn verification_rejects_an_unreadable_archive() {
         let dir = tools(&["1.0"]);
-        let dest = dir.path().join("broken.7z");
+        let dest = dir.path().join("broken.vmversion");
         std::fs::write(&dest, b"garbage").unwrap();
 
         let summary = Summary {
