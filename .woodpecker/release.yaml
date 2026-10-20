@@ -1,0 +1,133 @@
+# Manual release pipeline.
+#
+# Start it from the Woodpecker UI ("Run pipeline" on branch main) with:
+#
+#   RELEASE_VERSION     required; must equal `version` in Cargo.toml, so a
+#                       release is never cut by accident or from a stale bump
+#   RELEASE_DRAFT       optional, "true" creates a draft GitHub release
+#   RELEASE_PRERELEASE  optional, "true" marks the release as a pre-release
+#
+# It lints and cross-compiles the Windows build, packs
+# vmanager-v<version>-windows-x86_64.zip (vmanager.exe, vman.exe, README,
+# LICENSE), writes SHA256SUMS, signs it with GPG
+# and publishes everything as GitHub release v<version>. GitHub creates the
+# tag on the release commit, so the pipeline never needs push access.
+#
+# Like CI, this does not run the test suite: run `cargo test` on Windows
+# before starting a release.
+#
+# Secrets (enable them for the "manual" event only):
+#   github_token        token with contents: write on this repository
+#   gpg_private_key     ASCII-armored private signing key
+#   gpg_passphrase      passphrase of that key
+
+when:
+  - event: manual
+    branch: main
+
+# The pinned cargo-deny and gh downloads are x86_64 builds.
+labels:
+  platform: linux/amd64
+
+variables:
+  - &rust_image docker.io/library/rust:1.97-bookworm
+  - &cargo_deny_version 0.20.2
+  - &gh_version 2.102.0
+
+steps:
+  - name: prepare
+    image: *rust_image
+    environment:
+      GITHUB_TOKEN:
+        from_secret: github_token
+    commands:
+      - VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+      - test -n "$${RELEASE_VERSION:-}" || { echo "Set RELEASE_VERSION=$${VERSION} to release this commit."; exit 1; }
+      - test "$${RELEASE_VERSION#v}" = "$${VERSION}" || { echo "RELEASE_VERSION=$${RELEASE_VERSION} but Cargo.toml says $${VERSION}."; exit 1; }
+      - |
+        status=$(curl -sS -o /dev/null -w '%{http_code}' \
+          -H "Authorization: Bearer $${GITHUB_TOKEN}" \
+          "https://api.github.com/repos/$${CI_REPO}/git/ref/tags/v$${VERSION}")
+        case "$${status}" in
+          404) ;;
+          200) echo "Tag v$${VERSION} already exists - bump the version in Cargo.toml."; exit 1 ;;
+          *)   echo "GitHub answered $${status} while checking for tag v$${VERSION}."; exit 1 ;;
+        esac
+      - echo "$${VERSION}" > .release-version
+      - rm -rf dist && mkdir dist
+      - echo "Releasing vManager v$${VERSION} from $${CI_COMMIT_SHA}"
+
+  - name: deny
+    image: *rust_image
+    environment:
+      CARGO_DENY_VERSION: *cargo_deny_version
+    commands:
+      - curl -fsSL "https://github.com/EmbarkStudios/cargo-deny/releases/download/$${CARGO_DENY_VERSION}/cargo-deny-$${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz" | tar -xz --strip-components=1 -C /usr/local/bin
+      - cargo deny check licenses advisories bans sources
+
+  # Cross-compiled with mingw-w64. The resulting exe only links system DLLs
+  # (msvcrt, kernel32, ...); the objdump check fails the release if a mingw
+  # runtime DLL ever sneaks in, because users would not have it.
+  - name: build-windows
+    image: *rust_image
+    environment:
+      TARGET: x86_64-pc-windows-gnu
+    commands:
+      - apt-get update -qq && apt-get install -y -qq --no-install-recommends gcc-mingw-w64-x86-64 zip >/dev/null
+      - rustup component add rustfmt clippy
+      - rustup target add "$${TARGET}"
+      - VERSION=$(cat .release-version)
+      - cargo fmt --all --check
+      - RUSTFLAGS="-D warnings" cargo clippy --locked --all-targets --all-features --target "$${TARGET}"
+      - cargo build --locked --release --target "$${TARGET}"
+      - OUT="target/$${TARGET}/release"
+      - |
+        for exe in "$${OUT}/vmanager.exe" "$${OUT}/vman.exe"; do
+          x86_64-w64-mingw32-objdump -p "$${exe}" | grep 'DLL Name'
+          if x86_64-w64-mingw32-objdump -p "$${exe}" | grep -Ei 'DLL Name: (libwinpthread|libgcc_s|libstdc\+\+)'; then
+            echo "$${exe} depends on a mingw runtime DLL."; exit 1
+          fi
+        done
+      - NAME="vmanager-v$${VERSION}-windows-x86_64"
+      - rm -rf "stage/$${NAME}" && mkdir -p "stage/$${NAME}"
+      - cp "$${OUT}/vmanager.exe" "$${OUT}/vman.exe" README.md LICENSE "stage/$${NAME}/"
+      - (cd stage && zip -qrX "../dist/$${NAME}.zip" "$${NAME}")
+
+  - name: sign
+    image: *rust_image
+    environment:
+      GPG_PRIVATE_KEY:
+        from_secret: gpg_private_key
+      GPG_PASSPHRASE:
+        from_secret: gpg_passphrase
+    commands:
+      - export GNUPGHOME=$(mktemp -d)
+      - printf '%s\n' "$${GPG_PRIVATE_KEY}" | gpg --batch --quiet --import
+      - cd dist
+      - sha256sum vmanager-v* > SHA256SUMS
+      - cat SHA256SUMS
+      - printf '%s' "$${GPG_PASSPHRASE}" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --armor --detach-sign --output SHA256SUMS.asc SHA256SUMS
+      - gpg --batch --armor --export > vmanager-signing-key.asc
+      - gpg --batch --verify SHA256SUMS.asc SHA256SUMS
+      - sha256sum --check SHA256SUMS
+      - rm -rf "$${GNUPGHOME}"
+
+  - name: publish
+    image: *rust_image
+    environment:
+      GH_VERSION: *gh_version
+      GH_TOKEN:
+        from_secret: github_token
+    commands:
+      - curl -fsSL "https://github.com/cli/cli/releases/download/v$${GH_VERSION}/gh_$${GH_VERSION}_linux_amd64.tar.gz" | tar -xz --strip-components=2 -C /usr/local/bin "gh_$${GH_VERSION}_linux_amd64/bin/gh"
+      - VERSION=$(cat .release-version)
+      - FLAGS=""
+      - if [ "$${RELEASE_DRAFT:-false}" = true ]; then FLAGS="$${FLAGS} --draft"; fi
+      - if [ "$${RELEASE_PRERELEASE:-false}" = true ]; then FLAGS="$${FLAGS} --prerelease"; fi
+      - >
+        gh release create "v$${VERSION}" dist/*
+        --repo "$${CI_REPO}"
+        --target "$${CI_COMMIT_SHA}"
+        --title "vManager v$${VERSION}"
+        --generate-notes
+        $${FLAGS}
