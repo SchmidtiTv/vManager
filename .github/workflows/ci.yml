@@ -3,11 +3,20 @@ name: CI
 on:
   pull_request:
     branches: [main]
+  # New advisories land without any change here, so check weekly as well.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
-  
+
+jobs:
+  # Reads Cargo metadata only — it never builds or runs vManager, so the
+  # runner OS is irrelevant and the cheapest one is fine.
   deny:
     name: Licenses and advisories
     runs-on: ubuntu-latest

@@ -29,3 +29,5 @@ $RECYCLE.BIN/
 # Editor swap/backup files
 *.swp
 *~
+# macOS
+.DS_Store
