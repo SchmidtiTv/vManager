@@ -5,16 +5,16 @@
 Keeps the disk from filling up with old versions of your tools.
 
 Point vManager at a folder that holds one subfolder per version, and once a day
-it compresses everything except the newest few into `.7z` archives and deletes
-the folders it compressed. The old versions stay recoverable; the space they
+it compresses everything except the newest few into 7z archives named
+`<version>.vmversion` and deletes the folders it compressed. The old versions stay recoverable; the space they
 were using does not.
 
 ```
 C:\Tools\Blender\          before            C:\Tools\Blender\        after
-  4.1\   1.9 GiB                               4.1.7z   412 MiB
-  4.2\   2.0 GiB                               4.2.7z   430 MiB
-  4.3\   2.1 GiB                               4.3\     2.1 GiB
-  4.10\  2.2 GiB                               4.10\    2.2 GiB
+  4.1\   1.9 GiB                               4.1.vmversion  412 MiB
+  4.2\   2.0 GiB                               4.2.vmversion  430 MiB
+  4.3\   2.1 GiB                               4.3\           2.1 GiB
+  4.10\  2.2 GiB                               4.10\          2.2 GiB
 ```
 
 Written in Rust, with a local SQLite database recording every folder it watches
@@ -23,7 +23,7 @@ and every archive it has made.
 ## Building
 
 ```sh
-cargo build --release        # binary at target/release/vmanager
+cargo build --release        # binaries at target/release/vmanager and vman
 cargo run -- --help          # run it straight from the source tree
 cargo install --path .       # install into ~/.cargo/bin
 ```
@@ -42,6 +42,7 @@ vmanager run --dry-run                   # see what would be archived
 vmanager run                             # do it
 vmanager use C:\Tools\Blender 4.3        # point `current` at a version
 vmanager hook set C:\Tools\Blender launch C:\hooks\log.ps1
+vmanager pin                             # pick versions for this project
 vmanager schedule install                # …and every day at 03:00
 vmanager completions powershell          # complete commands as you type them
 ```
@@ -68,6 +69,10 @@ vmanager [OPTIONS] <COMMAND>
 | `hook set <FOLDER> <COMMAND> <SCRIPT>` | Run `<SCRIPT>` before `<COMMAND>` launches |
 | `hook remove <FOLDER> <COMMAND>` | Remove a configured hook |
 | `hook list [--folder <FOLDER>]` | Show configured hooks |
+| `pin` | Pick tool versions for the current directory in a menu |
+| `pin <TOOL> <VERSION>` | Pin one tool's version for the current directory |
+| `pin <TOOL>` | Show the tool's pin in the current directory |
+| `pin <TOOL> --clear` | Remove the tool's pin |
 | `schedule install` | Register the daily run with Windows Task Scheduler |
 | `schedule uninstall` | Remove the scheduled task |
 | `schedule status` | Show the scheduled task |
@@ -121,7 +126,7 @@ vmanager folder remove C:\Tools\Godot
 ### What you have
 
 `vmanager list` shows every version of every registered folder, oldest first,
-whether it is still unpacked or has already been swept into a `.7z`:
+whether it is still unpacked or has already been swept into a `.vmversion`:
 
 ```
 $ vmanager list
@@ -158,8 +163,8 @@ unpacked and compresses the rest:
 ```
 $ vmanager run
 C:\Tools\Blender  4 version(s), keeping 2
-  archived 4.1 -> 4.1.7z  842 files, 1.9 GiB -> 412.4 MiB, freed 1.5 GiB
-  archived 4.2 -> 4.2.7z  851 files, 2.0 GiB -> 430.1 MiB, freed 1.6 GiB
+  archived 4.1 -> 4.1.vmversion  842 files, 1.9 GiB -> 412.4 MiB, freed 1.5 GiB
+  archived 4.2 -> 4.2.vmversion  851 files, 2.0 GiB -> 430.1 MiB, freed 1.6 GiB
 C:\Tools\Godot  3 version(s), keeping 3
   nothing to archive
 
@@ -167,8 +172,15 @@ C:\Tools\Godot  3 version(s), keeping 3
 ```
 
 Each archive is written *next to* the folder it replaces, so `4.1\` becomes
-`4.1.7z` in the same place. Restoring is a normal 7-Zip extract — the folder
-name is stored inside the archive, so it comes back as `4.1\`.
+`4.1.vmversion` in the same place. The file is an ordinary 7z container under
+its own extension: `vmanager pin` unpacks one for you, and 7-Zip opens it too
+(it recognizes the format by content, not by name). The folder name is stored
+inside the archive, so it comes back as `4.1\`.
+
+Archives written before the `.vmversion` extension are named `<version>.7z`.
+`vmanager run` renames every `.7z` directly inside a swept folder to
+`.vmversion` (not under `--dry-run`) and updates its database record; if the
+new name is already taken, that folder fails with an error instead.
 
 Useful flags:
 
@@ -201,7 +213,7 @@ numbered. A folder where *nothing* is numbered falls back to modification
 time and treats every remaining subfolder as a version, so tools versioned by
 date-of-copy still work.
 
-Symlinks and junctions are skipped, files are ignored, and the `.7z` files from
+Symlinks and junctions are skipped, files are ignored, and the `.vmversion` files from
 previous runs are not mistaken for versions — so a daily sweep settles instead
 of eating one version per day.
 
@@ -210,8 +222,8 @@ of eating one version per day.
 The delete is what frees the disk, so it happens last and only after the
 archive has been proven good:
 
-1. the archive is written to a fresh `.7z`, and deleted again if compression
-   fails — a `.7z` on disk is never half-written. That includes the compressor
+1. the archive is written to a fresh `.vmversion`, and deleted again if compression
+   fails — a `.vmversion` on disk is never half-written. That includes the compressor
    crashing outright: it runs in-process, so a panic in it is caught, reported
    as that one folder failing, and the partial archive removed;
 2. it is read back and its file count compared against what was walked;
@@ -226,6 +238,25 @@ rather inspect the archives before trusting the deletion.
 One folder failing does not stop the others: an unplugged drive is reported,
 the remaining folders are still swept, and the run ends with a non-zero exit
 code so a failed scheduled run is visible in Task Scheduler's history.
+
+A version a project has [pinned](#pinning-versions-per-project) is never
+archived, however old it gets:
+
+```
+$ vmanager run
+C:\Tools\node  3 version(s), keeping 2
+  keeping 18.20 (pinned by C:\dev\legacy\.vmanagerversions)
+  nothing to archive
+
+0 archived, 0 skipped, 1 protected, 0 failed, 0 B freed
+```
+
+Every pin file `vmanager pin` has written is remembered in the database and
+read again at the start of each run, before any folder is touched. One that
+has since been deleted is forgotten with a warning (not under `--dry-run`);
+one that exists but cannot be parsed stops the whole run, since nobody can
+tell what it was protecting. Protection only ever applies to a version that
+would otherwise be archived.
 
 ### Selecting a version
 
@@ -267,9 +298,9 @@ C:\Tools\nodejs\
   24.18.0\
   current -> 24.18.0
   shim\
-    node.ps1
-    npm.ps1
-    npx.ps1
+    node.ps1  node.cmd
+    npm.ps1   npm.cmd
+    npx.ps1   npx.cmd
 ```
 
 `shim\` is created empty the moment `vmanager folder add` runs. It is
@@ -282,6 +313,14 @@ which must be on `PATH` at run time (WSL, Git for Windows and Cygwin all
 provide one). Put `C:\Tools\nodejs\shim` on `PATH` once, and every later
 `vmanager use nodejs <version>` changes what `node`, `npm` and `npx` run
 without touching `PATH` again — nothing here modifies `PATH` for you.
+
+Each `<command>.ps1` gets a `<command>.cmd` beside it for callers that find
+commands through `PATHEXT` and cannot run a PowerShell script themselves —
+`cmd.exe`, IDEs, build tools spawning `node`. The launcher only starts
+`powershell.exe -ExecutionPolicy Bypass -File <command>.ps1`, so pins and
+hooks behave identically, at the cost of a PowerShell startup per call. It is
+written only next to a `.ps1` vmanager generated, and a hand-written `.cmd` of
+the same name is left alone.
 
 That last part is the reason a version switch does not rewrite the shims: a
 `.ps1` resolves its target through `<folder>\current\...` *at run time*, not
@@ -324,6 +363,47 @@ two different hooks. Setting one before its shim exists is fine — it takes
 effect the moment discovery creates the shim; setting or clearing one on a
 shim that already exists patches that single `.ps1` immediately, so a hook
 change is never silently stale until the next `use` or `run`.
+
+### Pinning versions per project
+
+`current` is one choice for the whole machine. A project that needs a
+different version pins it in a `.vmanagerversions` file in its own directory:
+
+```sh
+cd C:\dev\legacy
+vmanager pin                    # arrow-key menu: tool, then version
+vmanager pin node 18.20         # …or directly
+vmanager pin node               # show the pin
+vmanager pin node --clear       # remove it
+```
+
+```toml
+# .vmanagerversions
+"node" = "18.20"
+```
+
+A tool is named by its registered folder's name (`node` for `C:\Tools\node`),
+not its path, so the file can be committed and still works on a machine with
+the tools installed elsewhere. Two registered folders with the same name are
+an error, since a pin file could not tell them apart.
+
+The menu lists every registered tool with its pin; enter opens a tool's
+versions, oldest first, with archived ones marked. ↑/↓ (or `j`/`k`) move,
+enter picks, esc goes back, `s` saves, `q` quits without saving. Picking
+`(not pinned)` removes the tool's pin, and entries for tools that are not
+registered on this machine are kept as they were. It draws on stderr and
+needs an interactive terminal; scripts use the direct form.
+
+Pinning an archived version unpacks it next to its `.vmversion` and, once the file
+count matches the archive, deletes the `.vmversion`. Pinning also regenerates the
+tool's shims, so shims written before pinning existed pick it up.
+
+Every shim looks for the pin at launch: starting in the working directory and
+walking up, the first `.vmanagerversions` that pins its tool decides which
+version runs; none means `current`. A pinned version that is not unpacked,
+that lacks the command, or whose line in the file the shim cannot read aborts
+with an error rather than quietly running `current`. The set of shims still comes from `current`, so a command that
+only an older pinned version has gets no shim.
 
 ## Scheduling the daily run
 
@@ -395,11 +475,12 @@ has shipped.
 Connections open with WAL journaling, `foreign_keys = ON` and a 5 second busy
 timeout, so a second `vmanager` waits its turn instead of failing.
 
-Three tables: `folders` is the registry `vmanager run` walks; `archives`
-records every `.7z` written, pointing back at the folder it came from; `hooks`
+Four tables: `folders` is the registry `vmanager run` walks; `archives`
+records every `.vmversion` written, pointing back at the folder it came from; `hooks`
 holds one row per `(folder, command)` pre-hook `vmanager hook set` has
-configured. The archive records are what let `vmanager list` report a
-version's original size — the one thing a `.7z` cannot tell you by looking at
+configured; `pin_files` lists every `.vmanagerversions` `vmanager pin` has
+written, so `vmanager run` knows which ones to read. The archive records are what let `vmanager list` report a
+version's original size — the one thing a `.vmversion` cannot tell you by looking at
 it. Unregistering a folder clears the archives' back-reference (`ON DELETE SET
 NULL`) rather than discarding the records — the files are still on disk, so
 their history should not vanish with the registration; `hooks` rows are keyed
@@ -448,7 +529,8 @@ copy of a tool, which is never what the key is meant to say.
 
 ```
 src/
-  main.rs             process entry point: parse, run, map errors to exit codes
+  main.rs             `vmanager` entry point; hands over to `vmanager::main`
+  bin/vman.rs         `vman`, the same program under a shorter name
   lib.rs              library crate; dispatches a parsed command
   cli.rs              clap definitions: global flags and the subcommand list
   version.rs          finding version folders and ordering them oldest first
@@ -456,6 +538,8 @@ src/
   archive.rs          7z creation: walking, filtering, compression
   link.rs             the `current` junction/symlink `use` points and reads
   shim.rs             discovering shim targets, writing shims, hook patching — filesystem-only
+  pinfile.rs          reading and writing `.vmanagerversions`
+  menu.rs             the `pin` menu as a pure state machine: keys in, lines out
   db.rs               SQLite connection, migrations and queries
   config.rs           config file discovery, parsing and defaults
   error.rs            error type and its exit-code mapping
@@ -468,13 +552,15 @@ src/
     use.rs            `vmanager use`
     shim.rs           `vmanager shim`
     hook.rs           `vmanager hook`
+    pin.rs            `vmanager pin`, including the raw-mode terminal driver
     schedule.rs       `vmanager schedule`
     completions.rs    `vmanager completions`
 tests/
   cli.rs              end-to-end tests that run the built binary
 ```
 
-`version.rs`, `sweep.rs` and `shim.rs` hold policy and stay filesystem-only: no
+`version.rs`, `sweep.rs`, `shim.rs` and `menu.rs` hold policy and stay free of
+I/O they do not need: no
 database, no printing, no clap. That is what lets the ordering rules, the
 archive-then-delete sequence and shim discovery/regeneration be tested
 directly, and it keeps `commands/run.rs` and `commands/shim.rs` down to
@@ -482,8 +568,9 @@ gathering settings, looping and reporting. `commands/hook.rs` is the thin CLI
 layer over the `hooks` table the same way `commands/folder.rs` is over
 `folders` — the database query lives in `db.rs`, not there.
 
-`main.rs` is deliberately thin: the logic lives in the library so tests and any
-future front-end can drive it without a process boundary.
+`main.rs` and `bin/vman.rs` are deliberately thin: the logic lives in the
+library so tests and any future front-end can drive it without a process
+boundary.
 
 ### Adding a command
 

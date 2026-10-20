@@ -3,7 +3,7 @@
 //!
 //! A registered folder is the parent of one tool's versions — `Tools\Blender`
 //! containing `4.1`, `4.2`, `4.3`. Each direct child *directory* is a
-//! candidate version; files (including the `.7z` archives vManager itself
+//! candidate version; files (including the `.vmversion` archives vManager itself
 //! writes) and symlinks are not.
 //!
 //! Ordering is by the numbers in the folder name: every run of digits becomes
@@ -205,12 +205,12 @@ pub fn list(root: &Path) -> Result<Listing> {
     Ok(sort(candidates))
 }
 
-/// One archived version: a `<name>.7z` sitting where its folder used to be.
+/// One archived version: a `<name>.vmversion` sitting where its folder used to be.
 #[derive(Debug, Clone)]
 pub struct ArchivedVersion {
     /// Full path to the archive.
     pub path: PathBuf,
-    /// The version's name, with the `.7z` extension stripped back off — so an
+    /// The version's name, with the `.vmversion` extension stripped back off — so an
     /// archived `4.1` reads as `4.1`, the same as when it was a folder.
     pub name: String,
     /// The version parsed from [`Self::name`], when it has one.
@@ -486,7 +486,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("1.0")).unwrap();
         std::fs::create_dir(dir.path().join("2.0")).unwrap();
         // An archive a previous run wrote must not be mistaken for a version.
-        std::fs::write(dir.path().join("0.9.7z"), b"7z").unwrap();
+        std::fs::write(dir.path().join("0.9.vmversion"), b"7z").unwrap();
 
         let listing = list(dir.path()).unwrap();
         assert_eq!(names(&listing), ["1.0", "2.0"]);
@@ -506,8 +506,8 @@ mod tests {
     #[test]
     fn archives_are_listed_oldest_first_with_their_size() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("4.10.7z"), b"newer archive").unwrap();
-        std::fs::write(dir.path().join("4.9.7z"), b"older").unwrap();
+        std::fs::write(dir.path().join("4.10.vmversion"), b"newer archive").unwrap();
+        std::fs::write(dir.path().join("4.9.vmversion"), b"older").unwrap();
         // Not archives: a live version, and an unrelated file.
         std::fs::create_dir(dir.path().join("4.11")).unwrap();
         std::fs::write(dir.path().join("notes.txt"), b"hello").unwrap();

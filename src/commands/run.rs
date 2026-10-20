@@ -5,13 +5,15 @@
 //! at the end and turned into a non-zero exit code, which is what makes a
 //! failed scheduled run visible in Task Scheduler's history.
 
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::archive::{self, human_bytes};
 use crate::commands::Context;
 use crate::db::{Database, FolderRecord};
 use crate::error::{Error, Result};
+use crate::pinfile;
 use crate::shim;
 use crate::sweep::{self, Outcome};
 
@@ -56,6 +58,9 @@ struct Totals {
     archived: u64,
     planned: u64,
     skipped: u64,
+    /// Versions that aged out of the newest few but stay unpacked because a
+    /// `.vmanagerversions` still pins them.
+    protected: u64,
     failed: u64,
     freed: u64,
 }
@@ -89,6 +94,11 @@ pub fn run(args: &Args, ctx: &Context) -> Result<()> {
         return Ok(());
     }
 
+    // Read before any folder is touched: a pin file that cannot be parsed
+    // means nobody knows what it protects, so nothing is archived at all.
+    let pinned = pinned_versions(&db, args.dry_run)?;
+    let no_pins = HashMap::new();
+
     let mut totals = Totals::default();
 
     for target in &targets {
@@ -99,7 +109,11 @@ pub fn run(args: &Args, ctx: &Context) -> Result<()> {
             .or_else(|| target.record.as_ref().and_then(|record| record.keep))
             .unwrap_or(default_keep);
 
-        match sweep_folder(ctx, &db, target, keep, &options, &mut totals) {
+        let pins = tool_name(&target.path)
+            .and_then(|name| pinned.get(&name))
+            .unwrap_or(&no_pins);
+
+        match sweep_folder(ctx, &db, target, keep, &options, pins, &mut totals) {
             Ok(()) => {
                 // Not under `--dry-run`, which must leave the disk exactly
                 // as it found it. Regenerated even when nothing was
@@ -171,15 +185,54 @@ fn targets(args: &Args, db: &Database) -> Result<Vec<Target>> {
         .collect()
 }
 
+/// Version name to the pin files pinning it, for one tool.
+type ToolPins = HashMap<String, Vec<PathBuf>>;
+
+/// Every version a remembered `.vmanagerversions` pins, keyed by tool name.
+///
+/// A pin file that no longer exists belonged to a project that is gone, so
+/// it is forgotten with a warning (except under `--dry-run`, which changes
+/// nothing). One that exists but cannot be read is an error.
+fn pinned_versions(db: &Database, dry_run: bool) -> Result<HashMap<String, ToolPins>> {
+    let mut pinned: HashMap<String, ToolPins> = HashMap::new();
+    for path in db.pin_files()? {
+        if !path.exists() {
+            tracing::warn!(path = %path.display(), "pin file no longer exists; forgetting it");
+            if !dry_run {
+                db.remove_pin_file(&path)?;
+            }
+            continue;
+        }
+        for (tool, version) in pinfile::read(&path)? {
+            pinned
+                .entry(tool)
+                .or_default()
+                .entry(version)
+                .or_default()
+                .push(path.clone());
+        }
+    }
+    Ok(pinned)
+}
+
+/// The name a pin file uses for the tool in `folder`: the folder's own name.
+pub fn tool_name(folder: &Path) -> Option<String> {
+    folder
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
 fn sweep_folder(
     ctx: &Context,
     db: &Database,
     target: &Target,
     keep: u32,
     options: &sweep::Options,
+    pins: &ToolPins,
     totals: &mut Totals,
 ) -> Result<()> {
-    let plan = sweep::plan(&target.path, keep)?;
+    let pinned: HashSet<String> = pins.keys().cloned().collect();
+    let plan = sweep::plan(&target.path, keep)?.protect(&pinned);
     let quiet = ctx.is_quiet();
     let mut out = std::io::stdout().lock();
 
@@ -192,6 +245,42 @@ fn sweep_folder(
         )?;
         for ignored in &plan.ignored {
             writeln!(out, "  ignoring {} (no version number)", ignored.display())?;
+        }
+        for protected in &plan.protected {
+            let files: Vec<String> = pins[&protected.name]
+                .iter()
+                .map(|file| file.display().to_string())
+                .collect();
+            writeln!(
+                out,
+                "  keeping {} (pinned by {})",
+                protected.name,
+                files.join(", ")
+            )?;
+        }
+    }
+    totals.protected += plan.protected.len() as u64;
+
+    // Not under `--dry-run`, which must leave the disk exactly as it found it.
+    if !options.dry_run {
+        for renamed in sweep::rename_legacy_archives(&target.path)? {
+            // A database problem is a warning, as in `record`: the file on
+            // disk already has its new name.
+            if let Err(err) = db.rename_archive(&renamed.from, &renamed.to) {
+                tracing::warn!(error = %err, archive = %renamed.to.display(), "archive renamed but its record could not be updated");
+            }
+            if !quiet {
+                writeln!(
+                    out,
+                    "  renamed {} -> {}",
+                    renamed
+                        .from
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy(),
+                    renamed.to.file_name().unwrap_or_default().to_string_lossy()
+                )?;
+            }
         }
     }
 
@@ -305,17 +394,18 @@ fn report(ctx: &Context, totals: &Totals, dry_run: bool) -> Result<()> {
     if dry_run {
         writeln!(
             out,
-            "\ndry run: {} version(s) would be archived, {} skipped",
-            totals.planned, totals.skipped
+            "\ndry run: {} version(s) would be archived, {} skipped, {} protected",
+            totals.planned, totals.skipped, totals.protected
         )?;
         return Ok(());
     }
 
     writeln!(
         out,
-        "\n{} archived, {} skipped, {} failed, {} freed",
+        "\n{} archived, {} skipped, {} protected, {} failed, {} freed",
         totals.archived,
         totals.skipped,
+        totals.protected,
         totals.failed,
         human_bytes(totals.freed)
     )?;

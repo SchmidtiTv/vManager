@@ -1,8 +1,8 @@
 //! `vmanager list` — what each registered folder currently holds.
 //!
 //! One line per version, oldest first, whether it is still unpacked or has
-//! already been swept into a `.7z`. The listing is built from the filesystem;
-//! the database is consulted only for what a `.7z` cannot tell you by looking
+//! already been swept into a `.vmversion`. The listing is built from the filesystem;
+//! the database is consulted only for what a `.vmversion` cannot tell you by looking
 //! at it — how large the version was before compression, and when it was
 //! archived. An archive with no record still appears, just with less detail.
 
@@ -52,7 +52,7 @@ struct Entry {
 enum Detail {
     /// Still a folder on disk.
     Unpacked,
-    /// Compressed to a `.7z`. The original size and file count are known only
+    /// Compressed to a `.vmversion`. The original size and file count are known only
     /// when the database still has the record.
     Archived {
         bytes: u64,

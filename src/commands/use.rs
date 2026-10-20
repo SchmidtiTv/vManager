@@ -84,7 +84,7 @@ pub fn run(args: &Args, ctx: &Context) -> Result<()> {
 
 /// Rebuild `<folder>/shim/` against whatever `current` (or, lacking that,
 /// the newest unpacked version) now contains.
-fn regenerate_shims(ctx: &Context, folder: &std::path::Path) -> Result<()> {
+pub fn regenerate_shims(ctx: &Context, folder: &std::path::Path) -> Result<()> {
     let db = ctx.open_database()?;
     let hooks = db
         .hooks_for_folder(folder)?

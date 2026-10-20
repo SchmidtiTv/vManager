@@ -1,4 +1,4 @@
-//! Creating `.7z` archives from a folder.
+//! Creating 7z archives (`.vmversion`, see [`EXTENSION`]) from a folder.
 //!
 //! Compression is pure Rust ([`sevenz_rust2`]) — no `7z` binary needs to be
 //! installed. Archives use LZMA2 in solid mode, which is what 7-Zip itself
@@ -16,8 +16,14 @@ use sevenz_rust2::{ArchiveEntry, ArchiveWriter, SourceReader, encoder_options::L
 
 use crate::error::{Error, Result};
 
-/// Extension used for every archive this module writes.
-pub const EXTENSION: &str = "7z";
+/// Extension used for every archive this module writes. The content is a
+/// plain 7z container; the extension says vManager put it there.
+pub const EXTENSION: &str = "vmversion";
+
+/// Extension archives were written with before [`EXTENSION`]. `vmanager run`
+/// renames these once (see `sweep::rename_legacy_archives`); nothing else
+/// reads it.
+pub const LEGACY_EXTENSION: &str = "7z";
 
 /// Compression level accepted by LZMA2.
 pub const MIN_LEVEL: u32 = 0;
@@ -159,6 +165,69 @@ pub fn create(source: &Path, dest: &Path, options: &Options) -> Result<Summary> 
         source_bytes,
         archive_bytes,
     })
+}
+
+/// Unpack `archive` back into the version folder `dest` it was made from.
+///
+/// The archive holds `<version>/…` (see the module docs), so it is extracted
+/// into `dest`'s parent. The unpacked file count is checked against the
+/// archive's own header before returning, and a failed or short extraction
+/// removes `dest` again — a half-unpacked folder would look like a usable
+/// version. The archive itself is left alone; deleting it is the caller's
+/// call. Returns the number of files unpacked.
+pub fn extract(archive: &Path, dest: &Path) -> Result<u64> {
+    if dest.exists() {
+        return Err(Error::Archive(format!(
+            "cannot unpack `{}`: `{}` already exists",
+            archive.display(),
+            dest.display()
+        )));
+    }
+    let parent = dest
+        .parent()
+        .ok_or_else(|| Error::Archive(format!("`{}` has no parent folder", dest.display())))?;
+
+    let expected = sevenz_rust2::Archive::open(archive)
+        .map_err(|err| Error::Archive(format!("`{}` could not be read: {err}", archive.display())))?
+        .files
+        .iter()
+        .filter(|entry| !entry.is_directory)
+        .count() as u64;
+
+    tracing::info!(archive = %archive.display(), dest = %dest.display(), files = expected, "unpacking archive");
+
+    let unpacked = sevenz_rust2::decompress_file(archive, parent)
+        .map_err(|err| Error::Archive(format!("unpacking `{}` failed: {err}", archive.display())))
+        .and_then(|()| {
+            if dest.is_dir() {
+                measure(dest, &Options::default()).map(|(files, _)| files)
+            } else {
+                Err(Error::Archive(format!(
+                    "`{}` does not contain `{}`",
+                    archive.display(),
+                    dest.file_name().unwrap_or_default().to_string_lossy()
+                )))
+            }
+        })
+        .and_then(|files| {
+            if files == expected {
+                Ok(files)
+            } else {
+                Err(Error::Archive(format!(
+                    "`{}` holds {expected} files but only {files} were unpacked into `{}`",
+                    archive.display(),
+                    dest.display()
+                )))
+            }
+        });
+
+    if unpacked.is_err()
+        && let Err(cleanup) = std::fs::remove_dir_all(dest)
+        && cleanup.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(path = %dest.display(), error = %cleanup, "could not remove partially unpacked folder");
+    }
+    unpacked
 }
 
 /// Render a byte count for humans: `1.2 MiB`.
@@ -557,6 +626,44 @@ mod tests {
             std::fs::read_to_string(out.join("photos/.git/config")).unwrap(),
             "junk"
         );
+    }
+
+    #[test]
+    fn extract_restores_the_folder_it_was_made_from() {
+        let dir = fixture();
+        let source = dir.path().join("photos");
+        let dest = dir.path().join("photos.7z");
+        create(&source, &dest, &Options::default()).unwrap();
+        std::fs::remove_dir_all(&source).unwrap();
+
+        assert_eq!(extract(&dest, &source).unwrap(), 3);
+        assert_eq!(
+            std::fs::read_to_string(source.join("sub/b.txt")).unwrap(),
+            "world!"
+        );
+        assert!(dest.is_file(), "the archive is the caller's to delete");
+    }
+
+    #[test]
+    fn extract_refuses_to_unpack_over_an_existing_folder() {
+        let dir = fixture();
+        let source = dir.path().join("photos");
+        let dest = dir.path().join("photos.7z");
+        create(&source, &dest, &Options::default()).unwrap();
+
+        assert!(extract(&dest, &source).is_err());
+    }
+
+    #[test]
+    fn extract_into_a_name_the_archive_does_not_hold_cleans_up() {
+        let dir = fixture();
+        let dest = dir.path().join("photos.7z");
+        create(&dir.path().join("photos"), &dest, &Options::default()).unwrap();
+
+        let renamed = dir.path().join("elsewhere").join("videos");
+        std::fs::create_dir_all(renamed.parent().unwrap()).unwrap();
+        assert!(extract(&dest, &renamed).is_err());
+        assert!(!renamed.exists());
     }
 
     #[test]

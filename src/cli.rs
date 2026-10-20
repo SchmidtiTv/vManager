@@ -19,6 +19,7 @@ Getting started:
   vmanager use C:\\Tools\\Blender 4.3      Point `current` at a version
   vmanager shim regenerate                 Rebuild a folder's shim\\ scripts
   vmanager hook set nodejs node setup.ps1  Run a script before `node` launches
+  vmanager pin                            Pick tool versions for this directory
   vmanager schedule install               Run it daily at 03:00
   vmanager completions --help             Complete commands as you type them
 
@@ -158,6 +159,9 @@ pub enum Command {
 
     /// Configure the pre-hook a shim runs before its command
     Hook(crate::commands::hook::Args),
+
+    /// Pin tool versions for the current directory in `.vmanagerversions`
+    Pin(crate::commands::pin::Args),
 
     /// Print the shell completion script for the given shell
     Completions(crate::commands::completions::Args),
