@@ -14,7 +14,6 @@
 //! after the archive is on disk and has been read back. A failure anywhere
 //! before that leaves the version folder untouched.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::archive::{self, Summary};
@@ -50,46 +49,17 @@ pub struct Plan {
     pub victims: Vec<VersionFolder>,
     /// Child folders that are not versions and will not be touched.
     pub ignored: Vec<PathBuf>,
-    /// Versions that would otherwise be in [`Self::victims`], but a project
-    /// pManager tracks is still pinned to them. Always empty until
-    /// [`Self::protect`] is called — `plan` itself knows nothing about
-    /// pManager, only the filesystem.
-    pub protected: Vec<VersionFolder>,
 }
 
 impl Plan {
     /// Total number of version folders found.
     pub fn version_count(&self) -> usize {
-        self.kept.len() + self.victims.len() + self.protected.len()
+        self.kept.len() + self.victims.len()
     }
 
     /// Whether this folder has nothing to do.
     pub fn is_empty(&self) -> bool {
         self.victims.is_empty()
-    }
-
-    /// Move any victim named in `pinned` out of [`Self::victims`] and into
-    /// [`Self::protected`], so a version that has aged out of the newest few
-    /// is still not archived while pManager still has a project pinned to
-    /// it.
-    ///
-    /// `pinned` maps a version *name* — matched exactly, the same string
-    /// `vmanager use` would take as `<VERSION>` — to the project name(s)
-    /// pinning it, kept only so the caller can explain the skip. Matching is
-    /// by name alone: the caller has already narrowed `pinned` down to pins
-    /// for this plan's own folder (see `commands::run::sweep_folder`), so
-    /// nothing here needs to know a folder path at all.
-    pub fn protect(&mut self, pinned: &HashMap<String, Vec<String>>) {
-        if pinned.is_empty() {
-            return;
-        }
-
-        let candidates = std::mem::take(&mut self.victims);
-        let (protected, victims) = candidates
-            .into_iter()
-            .partition(|victim| pinned.contains_key(&victim.name));
-        self.protected = protected;
-        self.victims = victims;
     }
 }
 
@@ -135,7 +105,6 @@ pub fn plan(root: &Path, keep: u32) -> Result<Plan> {
         kept,
         victims: versions,
         ignored: listing.ignored,
-        protected: Vec::new(),
     })
 }
 
@@ -269,55 +238,6 @@ mod tests {
             let plan = plan(dir.path(), 2).unwrap();
             assert!(plan.is_empty(), "should be a no-op for {versions:?}");
         }
-    }
-
-    #[test]
-    fn protecting_a_pinned_version_moves_it_out_of_the_victims() {
-        let dir = tools(&["1.0", "2.0", "3.0", "4.0"]);
-        let mut plan = plan(dir.path(), 2).unwrap();
-        assert_eq!(victim_names(&plan), ["1.0", "2.0"]);
-
-        let mut pinned = HashMap::new();
-        pinned.insert("1.0".to_string(), vec!["legacy-tool".to_string()]);
-        plan.protect(&pinned);
-
-        assert_eq!(victim_names(&plan), ["2.0"]);
-        assert_eq!(
-            plan.protected
-                .iter()
-                .map(|entry| entry.name.as_str())
-                .collect::<Vec<_>>(),
-            ["1.0"]
-        );
-        // Still counted, just no longer a victim.
-        assert_eq!(plan.version_count(), 4);
-    }
-
-    #[test]
-    fn protecting_with_nothing_pinned_changes_nothing() {
-        let dir = tools(&["1.0", "2.0", "3.0"]);
-        let mut plan = plan(dir.path(), 2).unwrap();
-        let before: Vec<String> = victim_names(&plan).into_iter().map(String::from).collect();
-
-        plan.protect(&HashMap::new());
-
-        assert_eq!(victim_names(&plan), before);
-        assert!(plan.protected.is_empty());
-    }
-
-    #[test]
-    fn protecting_a_version_that_is_already_kept_does_nothing() {
-        // Pinned to the newest version, which was never going to be archived
-        // anyway — protect() only ever moves things out of victims.
-        let dir = tools(&["1.0", "2.0", "3.0"]);
-        let mut plan = plan(dir.path(), 2).unwrap();
-
-        let mut pinned = HashMap::new();
-        pinned.insert("3.0".to_string(), vec!["api-server".to_string()]);
-        plan.protect(&pinned);
-
-        assert_eq!(victim_names(&plan), ["1.0"]);
-        assert!(plan.protected.is_empty());
     }
 
     #[test]
