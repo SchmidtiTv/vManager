@@ -1401,12 +1401,11 @@ fn shim_regenerate_rebuilds_a_cleared_shim_directory() {
 fn a_same_folder_exe_name_collision_names_both_paths_and_exits_with_failure() {
     let (dir, config) = isolated();
     let tool = tool_folder(dir.path(), "node", &["18.20"]);
-    // Two exes that both resolve to the `node` command, in different bin
-    // directories under the same version.
-    std::fs::create_dir_all(tool.join("18.20").join("bin1")).unwrap();
-    std::fs::create_dir_all(tool.join("18.20").join("bin2")).unwrap();
-    std::fs::write(tool.join("18.20").join("bin1").join("node.exe"), b"a").unwrap();
-    std::fs::write(tool.join("18.20").join("bin2").join("node.exe"), b"b").unwrap();
+    // Two exes that both resolve to the `node` command: one at the version
+    // root, one in its `bin\`.
+    std::fs::create_dir_all(tool.join("18.20").join("bin")).unwrap();
+    std::fs::write(tool.join("18.20").join("node.exe"), b"a").unwrap();
+    std::fs::write(tool.join("18.20").join("bin").join("node.exe"), b"b").unwrap();
 
     vmanager()
         .arg("use")
@@ -1417,9 +1416,8 @@ fn a_same_folder_exe_name_collision_names_both_paths_and_exits_with_failure() {
         .assert()
         .code(1)
         .stderr(
-            predicate::str::contains("node")
-                .and(predicate::str::contains("bin1"))
-                .and(predicate::str::contains("bin2")),
+            predicate::str::contains("current\\node.exe")
+                .and(predicate::str::contains("current\\bin\\node.exe")),
         );
 
     // The link itself is still set — only the shim regeneration failed,

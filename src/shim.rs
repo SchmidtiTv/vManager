@@ -65,10 +65,9 @@ const LAUNCHER_HEADER: &str =
 /// directly) is decided by [`interpreter_for`].
 const TARGET_EXTENSIONS: &[&str] = &["exe", "ps1", "bat", "sh", "zsh"];
 
-/// Directory name [`discover`] never recurses into — see its doc comment
-/// for why a dependency's own `node_modules` tree is not a source of
-/// top-level shim targets.
-const NODE_MODULES_DIR_NAME: &str = "node_modules";
+/// The one subdirectory of a version [`discover`] looks into besides its
+/// root.
+const BIN_DIR_NAME: &str = "bin";
 
 /// One executable or script discovered under a folder's active version —
 /// see [`TARGET_EXTENSIONS`] for which file types qualify.
@@ -146,65 +145,42 @@ pub fn active_root(folder: &Path) -> Result<Option<PathBuf>> {
     Ok(listing.versions.last().map(|version| version.path.clone()))
 }
 
-/// Find every shim target — see [`TARGET_EXTENSIONS`] — under the folder's
-/// active version.
+/// Find every shim target — see [`TARGET_EXTENSIONS`] — in the folder's
+/// active version: directly in its root and in its `bin\`, nowhere deeper.
 ///
-/// Recurses into subdirectories (a `bin\` layout is common) but skips the
-/// `shim\` directory itself, any `node_modules\` directory, and any `.vmversion`
-/// file. A symlinked entry is neither a directory nor a file to
-/// `DirEntry::file_type`, so — same as [`crate::archive`]'s walk and
-/// [`version::list`] — it is silently skipped rather than followed, which
-/// also keeps a stray `current` reached while walking a date-versioned tool
-/// from being descended into twice.
+/// Those two places are where tools put what they mean to be run (`node.exe`
+/// and `npm.ps1` at the root, `java.exe` or `cmake.exe` under `bin\`).
+/// Everything below is the tool's own internals — cmake's
+/// `share\cmake-*\Modules\` alone holds hundreds of helper scripts, some as
+/// both `.bat` and `.sh`, and Node keeps per-shell copies of `corepack.ps1`
+/// deep in `node_modules\` — none of which should become commands. Symlinked
+/// entries and directories are skipped, and so is a `.vmversion` left over
+/// from a sweep, since only [`TARGET_EXTENSIONS`] count.
 ///
-/// `node_modules` is skipped because it holds a dependency's own packaging,
-/// not the tool's top-level binaries: Node ships `corepack.ps1` (among
-/// others) both at the install root and again inside
-/// `node_modules\corepack\shims\`, in two variants (`shims\corepack.ps1` and
-/// `shims\nodewin\corepack.ps1`) that exist for npm's own use on other
-/// platforms and shells, not to be discovered as a second `corepack` command
-/// here. Walking into `node_modules` at all risks exactly that kind of
-/// same-stem duplicate — or an unrelated package's `bin` entry — several
-/// layers below the binaries a folder was actually registered for.
-///
-/// Two targets that resolve to the same command name is a same-folder
-/// collision: rare, but real (a tool that ships two same-named binaries
-/// under different `bin` directories, or an `install.exe` next to an
-/// `install.ps1`), and reported rather than silently resolved by picking
-/// one — which one the shim would launch would depend on directory walk
-/// order, not something to build a launcher on.
+/// Two targets that resolve to the same command name (an `install.exe` next
+/// to an `install.ps1`, or a `tool.exe` both at the root and in `bin\`) is a
+/// collision, reported rather than silently resolved by picking one.
 pub fn discover(folder: &Path) -> Result<Vec<ExeEntry>> {
     let Some(root) = active_root(folder)? else {
         return Ok(Vec::new());
     };
 
     let mut found = Vec::new();
-    let mut stack = vec![root.clone()];
+    let bin = root.join(BIN_DIR_NAME);
+    let dirs = if bin.is_dir() {
+        vec![root.clone(), bin]
+    } else {
+        vec![root.clone()]
+    };
 
-    while let Some(dir) = stack.pop() {
+    for dir in dirs {
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
             let path = entry.path();
 
-            if entry.file_name().to_string_lossy() == SHIM_DIR_NAME {
+            if !entry.file_type()?.is_file() {
                 continue;
             }
-            if entry.file_name().to_string_lossy() == NODE_MODULES_DIR_NAME {
-                continue;
-            }
-
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if !file_type.is_file() {
-                continue;
-            }
-
-            // Keeping only recognized extensions also takes care of
-            // skipping a `.vmversion` left over from a previous sweep, without a
-            // separate check for it.
             let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
                 continue;
             };
@@ -687,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_the_shim_directory_and_archives_while_recursing() {
+    fn the_shim_directory_and_archives_are_never_picked_up() {
         let dir = tempfile::tempdir().unwrap();
         let root = tool(dir.path(), "1.0", &["tool.exe"], Some("1.0"));
 
@@ -708,26 +684,29 @@ mod tests {
     }
 
     #[test]
-    fn node_modules_is_never_recursed_into() {
+    fn nothing_below_the_root_or_bin_is_discovered() {
         let dir = tempfile::tempdir().unwrap();
-        let root = tool(dir.path(), "1.0", &["node.exe"], Some("1.0"));
+        let root = tool(
+            dir.path(),
+            "1.0",
+            &["node.exe", "bin\\cmake.exe"],
+            Some("1.0"),
+        );
 
-        // Real-world shape reported against corepack: the package's own
-        // `shims\` directory ships `corepack.ps1` twice — once directly and
-        // once again under `nodewin\` — both nested under `node_modules`.
-        // Before this fix that was a same-folder collision on every
-        // `shim regenerate`; now neither is even discovered.
+        // Real-world shapes: cmake's module helpers ship as both `.bat` and
+        // `.sh`, and corepack keeps per-shell copies deep in `node_modules`.
         write_exes(
             &root.join(link::LINK_NAME),
             &[
+                "share\\cmake-3.31\\Modules\\Squish4RunTestCase.bat",
+                "share\\cmake-3.31\\Modules\\Squish4RunTestCase.sh",
                 "node_modules\\corepack\\shims\\corepack.ps1",
-                "node_modules\\corepack\\shims\\nodewin\\corepack.ps1",
-                "node_modules\\.bin\\some-tool.exe",
+                "bin\\nested\\helper.exe",
             ],
         );
 
         let entries = discover(&root).unwrap();
-        assert_eq!(commands(&entries), ["node"]);
+        assert_eq!(commands(&entries), ["cmake", "node"]);
     }
 
     #[test]
@@ -736,7 +715,7 @@ mod tests {
         let root = tool(
             dir.path(),
             "1.0",
-            &["bin\\node.exe", "alt\\node.exe"],
+            &["node.exe", "bin\\node.exe"],
             Some("1.0"),
         );
 
@@ -745,16 +724,15 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("node"), "{message}");
         assert!(message.contains("bin"), "{message}");
-        assert!(message.contains("alt"), "{message}");
     }
 
     #[test]
     fn relative_paths_always_use_backslashes() {
         let dir = tempfile::tempdir().unwrap();
-        let root = tool(dir.path(), "1.0", &["deep\\sub\\tool.exe"], Some("1.0"));
+        let root = tool(dir.path(), "1.0", &["bin\\tool.exe"], Some("1.0"));
 
         let entries = discover(&root).unwrap();
-        assert_eq!(entries[0].relative, "deep\\sub\\tool.exe");
+        assert_eq!(entries[0].relative, "bin\\tool.exe");
     }
 
     #[test]

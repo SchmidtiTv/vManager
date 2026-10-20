@@ -306,8 +306,10 @@ C:\Tools\nodejs\
 `shim\` is created empty the moment `vmanager folder add` runs. It is
 populated the first time `vmanager use` or `vmanager run` has something to
 scan — one `<command>.ps1` per `.exe`, `.ps1`, `.bat`, `.sh` or `.zsh` found
-under `current` (or, lacking that, the newest unpacked version), recursing
-into subfolders like `bin\`. `.exe`, `.ps1` and `.bat` targets are launched
+directly in `current` (or, lacking that, the newest unpacked version) or in
+its `bin\`. Nothing deeper counts: that is where tools keep their internals,
+like the hundreds of helper scripts under cmake's `share\` or the copies in
+Node's `node_modules\`. `.exe`, `.ps1` and `.bat` targets are launched
 directly; `.sh` and `.zsh` targets are handed to `bash`/`zsh` respectively,
 which must be on `PATH` at run time (WSL, Git for Windows and Cygwin all
 provide one). Put `C:\Tools\nodejs\shim` on `PATH` once, and every later
