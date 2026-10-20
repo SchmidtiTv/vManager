@@ -1,5 +1,6 @@
-# Formatting, lints and a Windows release build on every push to main and
-# every pull request, plus the dependency checks of .github/workflows/ci.yml.
+# Formatting, lints, a Windows release build and dependency checks on every
+# push to main or dev and on every pull request. Pull requests from dev into
+# main also run deep.yaml.
 #
 # Windows is the only platform vManager targets, so clippy lints the Windows
 # build: it cross-compiles for x86_64-pc-windows-gnu with mingw-w64 (the
@@ -15,7 +16,7 @@
 
 when:
   - event: push
-    branch: main
+    branch: [main, dev]
   - event: pull_request
 
 # The pinned cargo-deny download is an x86_64 build.
